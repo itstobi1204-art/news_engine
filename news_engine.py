@@ -1,20 +1,3 @@
-"""
-News AI Engine - pulls official economic calendar + market news and pushes
-compact, formatted alerts to Telegram (with images, IST time, source links).
-
-Instruments tracked: XAUUSD, EURUSD, NZDUSD, USOIL, US500
-
-Data sources:
-1. Finnhub  -> Economic calendar (NFP, CPI, rate decisions etc) + real market news
-2. EIA.gov  -> Official US oil inventory data (best official source for USOIL)
-
-(Alpha Vantage was removed - its feed was mostly institutional filing alerts,
-not trading-relevant news, and duplicated what Finnhub already covers well.)
-
-Every message is tagged with which platform the data came from, shows the
-time in IST, and includes the source image when the API provides one.
-"""
-
 import os
 import json
 import time
@@ -25,8 +8,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---- Persistent state file (survives between GitHub Actions runs) ----
-# EIA data updates weekly, so a short time-window filter alone would keep
-# re-sending the same value on every run within that week - needs real memory.
 STATE_FILE = "state.json"
 
 
@@ -34,16 +15,21 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "sent_ids" not in data:
+                    data["sent_ids"] = []
+                return data
         except Exception as e:
             print("State load error:", e)
-    return {"sent_eia_ids": []}
+    return {"sent_ids": []}
 
 
 def save_state(state):
     try:
+        # Keep only the last 200 IDs to avoid endless file growth
+        state["sent_ids"] = state.get("sent_ids", [])[-200:]
         with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+            json.dump(state, f, indent=2)
     except Exception as e:
         print("State save error:", e)
 
@@ -69,10 +55,6 @@ INSTRUMENT_KEYWORDS = {
 
 CURRENCY_FILTER = ["USD", "EUR", "NZD"]
 
-# GitHub Actions runs this fresh with no memory of prior runs. Instead of
-# in-memory dedup, we only push items published within this many minutes.
-# Set a bit wider than your cron interval (10 min) so nothing slips through
-# the gap between runs.
 RECENCY_WINDOW_MIN = 20
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -89,8 +71,7 @@ def to_ist_string(dt_utc: datetime) -> str:
 def compact_summary(text: str, max_chars: int = 280) -> str:
     """
     Trim a headline/summary down to its essential point without cutting
-    mid-sentence where possible. Not a fixed length - short items stay
-    short, longer items get trimmed at the nearest sentence/word boundary.
+    mid-sentence where possible.
     """
     if not text:
         return ""
@@ -98,14 +79,12 @@ def compact_summary(text: str, max_chars: int = 280) -> str:
     if len(text) <= max_chars:
         return text
 
-    # Try to cut at the last sentence-ending punctuation before the limit
     cut = text[:max_chars]
     for punct in [". ", "! ", "? "]:
         idx = cut.rfind(punct)
-        if idx > max_chars * 0.4:  # don't cut too early
+        if idx > max_chars * 0.4:
             return cut[:idx + 1].strip()
 
-    # Fall back to nearest word boundary
     idx = cut.rfind(" ")
     if idx > 0:
         cut = cut[:idx]
@@ -131,23 +110,19 @@ def send_telegram(message: str, retries: int = 3):
                 timeout=20,
             )
             if resp.status_code == 200:
-                return
+                return True
             print(f"Telegram send failed (attempt {attempt}):", resp.text)
         except Exception as e:
             print(f"Telegram error (attempt {attempt}):", e)
         time.sleep(2)
     print("Telegram send permanently failed after retries.")
+    return False
 
 
 def send_telegram_with_image(caption: str, image_url: str, retries: int = 3):
-    """
-    Push a message WITH an image if the source provided one.
-    Falls back to a text-only message if the image fails to send
-    (e.g. broken URL) so you never silently miss a news item.
-    """
+    """Push a message WITH an image if the source provided one."""
     if not image_url:
-        send_telegram(caption, retries=retries)
-        return
+        return send_telegram(caption, retries=retries)
 
     for attempt in range(1, retries + 1):
         try:
@@ -162,15 +137,14 @@ def send_telegram_with_image(caption: str, image_url: str, retries: int = 3):
                 timeout=20,
             )
             if resp.status_code == 200:
-                return
+                return True
             print(f"Telegram photo send failed (attempt {attempt}):", resp.text)
         except Exception as e:
             print(f"Telegram photo error (attempt {attempt}):", e)
         time.sleep(2)
 
-    # Image failed after retries - fall back to text-only so the news isn't lost
     print("Falling back to text-only message after image failure.")
-    send_telegram(caption, retries=1)
+    return send_telegram(caption, retries=1)
 
 
 def impact_emoji(impact: str) -> str:
@@ -185,10 +159,10 @@ def impact_emoji(impact: str) -> str:
 
 
 # ============================================================
-# SOURCE 1: FINNHUB - Economic Calendar (live actual/forecast data)
+# SOURCE 1: FINNHUB - Economic Calendar
 # ============================================================
 
-def fetch_finnhub_calendar():
+def fetch_finnhub_calendar(state: dict):
     """Docs: https://finnhub.io/docs/api/economic-calendar"""
     if not FINNHUB_KEY:
         return
@@ -214,31 +188,37 @@ def fetch_finnhub_calendar():
 
         actual = ev.get("actual")
         if actual is None:
-            continue  # only push once the real result is out
+            continue
 
         event_time_str = ev.get("time")
         try:
             event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError):
-            continue  # no reliable timestamp - skip rather than risk a stale repeat
+            continue
 
         age_minutes = (now - event_time).total_seconds() / 60
         if age_minutes > RECENCY_WINDOW_MIN or age_minutes < -5:
             continue
 
+        # Prevent sending duplicates
+        event_id = f"cal_{ev.get('event')}_{event_time_str}_{actual}"
+        if event_id in state["sent_ids"]:
+            continue
+
         ist_str = to_ist_string(event_time)
 
         msg = (
-            f"{impact_emoji(ev.get('impact'))} <b>{ev.get('impact', 'N/A').upper()} IMPACT — {currency}</b>\n"
-            f"📊 {ev.get('event')}\n"
-            f"📈 Actual: <b>{ev.get('actual')}</b> | Forecast: {ev.get('estimate')} | Previous: {ev.get('prev')}\n"
+            f"{impact_emoji(ev.get('impact'))} <b>ECONOMIC DATA RELEASE</b>\n"
+            f"📌 <b>{ev.get('event')}</b> ({currency})\n\n"
+            f"📈 Actual: <b>{ev.get('actual')}</b> | Forecast: {ev.get('estimate', 'N/A')} | Prev: {ev.get('prev', 'N/A')}\n"
             f"🕒 {ist_str}\n\n"
             f"📌 Platform: Finnhub (Economic Calendar)"
         )
-        send_telegram(msg)
+        if send_telegram(msg):
+            state["sent_ids"].append(event_id)
 
 
-def fetch_finnhub_news():
+def fetch_finnhub_news(state: dict):
     """Docs: https://finnhub.io/docs/api/market-news"""
     if not FINNHUB_KEY:
         return
@@ -257,10 +237,15 @@ def fetch_finnhub_news():
     for art in articles:
         published_ts = art.get("datetime")
         if not published_ts:
-            continue  # no timestamp - skip rather than risk sending a stale repeat
+            continue
 
         age_minutes = (now_ts - published_ts) / 60
         if age_minutes > RECENCY_WINDOW_MIN or age_minutes < -5:
+            continue
+
+        # Prevent sending duplicates
+        article_id = f"news_{art.get('id', art.get('url'))}"
+        if article_id in state["sent_ids"]:
             continue
 
         headline = art.get("headline", "")
@@ -274,24 +259,26 @@ def fetch_finnhub_news():
 
         published_dt = datetime.utcfromtimestamp(published_ts)
         ist_str = to_ist_string(published_dt)
-
         body = compact_summary(summary or headline)
+        matched_str = " ".join([f"#{m}" for m in matched])
 
         caption = (
-            f"📰 <b>{headline}</b>\n"
-            f"🎯 {', '.join(matched)}\n"
+            f"🚨 <b>MARKET NEWS</b>\n"
+            f"🎯 Relevant to: <b>{matched_str}</b>\n\n"
+            f"📰 <b>{headline}</b>\n\n"
             f"{body}\n\n"
             f"🕒 {ist_str}\n"
-            f"🔗 {art.get('url')}\n\n"
+            f"🔗 <a href='{art.get('url')}'>Read Source Article</a>\n\n"
             f"📌 Platform: Finnhub (Market News)"
         )
 
         image_url = art.get("image")
-        send_telegram_with_image(caption, image_url)
+        if send_telegram_with_image(caption, image_url):
+            state["sent_ids"].append(article_id)
 
 
 # ============================================================
-# SOURCE 2: EIA.gov - Official US oil inventory data (for USOIL)
+# SOURCE 2: EIA.gov - Official US oil inventory data
 # ============================================================
 
 def fetch_eia_oil_data(state: dict):
@@ -321,27 +308,27 @@ def fetch_eia_oil_data(state: dict):
         return
 
     latest = rows[0]
-    record_id = f"{latest.get('period')}_{latest.get('value')}"
-    if record_id in state.get("sent_eia_ids", []):
+    record_id = f"eia_{latest.get('period')}_{latest.get('value')}"
+    
+    if record_id in state["sent_ids"]:
         return
-    state.setdefault("sent_eia_ids", []).append(record_id)
-    state["sent_eia_ids"] = state["sent_eia_ids"][-20:]
 
     now_ist = to_ist_string(datetime.utcnow())
 
     msg = (
         f"🛢️ <b>US OIL INVENTORY DATA</b>\n"
-        f"🎯 USOIL\n"
-        f"📅 Period: {latest.get('period')}\n"
-        f"📊 Ending Stocks: <b>{latest.get('value')} {latest.get('units', '')}</b>\n\n"
+        f"🎯 Relevant to: <b>#USOIL</b>\n\n"
+        f"📅 Period: <code>{latest.get('period')}</code>\n"
+        f"📊 Ending Stocks: <b>{latest.get('value')} {latest.get('units', 'MBBL')}</b>\n\n"
         f"🕒 {now_ist}\n\n"
         f"📌 Platform: EIA.gov (Official U.S. Govt Data)"
     )
-    send_telegram(msg)
+    if send_telegram(msg):
+        state["sent_ids"].append(record_id)
 
 
 # ============================================================
-# MAIN - runs ONCE per execution (GitHub Actions cron handles the looping)
+# MAIN - runs ONCE per execution
 # ============================================================
 
 def main():
@@ -349,10 +336,9 @@ def main():
 
     state = load_state()
 
-    fetch_finnhub_calendar()
-    fetch_finnhub_news()
+    fetch_finnhub_calendar(state)
+    fetch_finnhub_news(state)
 
-    # EIA is weekly data - check it roughly once per hour, not every 10 min
     if datetime.utcnow().minute < 10:
         fetch_eia_oil_data(state)
 
@@ -362,7 +348,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
