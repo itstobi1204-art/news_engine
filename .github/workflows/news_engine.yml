@@ -1,0 +1,44 @@
+name: News Engine
+
+# Runs automatically every 10 minutes, forever, for free on GitHub's servers.
+# You can also trigger it manually from the "Actions" tab using "Run workflow".
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+# Needed so the workflow can commit the updated state.json file back to the repo
+permissions:
+  contents: write
+
+jobs:
+  run-news-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run news engine
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python news_engine.py
+
+      - name: Save updated state file back to the repo
+        run: |
+          git config --global user.name "news-engine-bot"
+          git config --global user.email "actions@github.com"
+          git add state.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update state [skip ci]"
+          git push || true
