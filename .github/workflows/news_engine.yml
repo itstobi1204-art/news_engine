@@ -1,44 +1,58 @@
-name: News Engine
+name: Live News Daemon
 
-# Runs automatically every 10 minutes, forever, for free on GitHub's servers.
-# You can also trigger it manually from the "Actions" tab using "Run workflow".
 on:
   schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+    # Restarts the 5-hour loop automatically every 5 hours
+    - cron: '0 */5 * * *'
+  # Allows manual start anytime from the GitHub Actions tab
+  workflow_dispatch:
+  # Starts automatically whenever you push code changes to main
+  push:
+    branches:
+      - main
 
-# Needed so the workflow can commit the updated state.json file back to the repo
+# Grant write permissions so the bot can commit updated state.json back to your repo
 permissions:
   contents: write
 
+# Prevent multiple duplicate runners from running at the same time
+concurrency:
+  group: news-engine-daemon
+  cancel-in-progress: true
+
 jobs:
-  run-news-engine:
+  run-live-daemon:
     runs-on: ubuntu-latest
+    # GitHub maximum job limit is 360 min; set 320 min (5 hr 20 min) buffer for safety
+    timeout-minutes: 320
+
     steps:
-      - name: Check out repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv
 
-      - name: Run news engine
+      - name: Execute Live News Stream
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_engine.py
 
-      - name: Save updated state file back to the repo
+      - name: Save Updated state.json
         run: |
-          git config --global user.name "news-engine-bot"
-          git config --global user.email "actions@github.com"
-          git add state.json || true
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update state [skip ci]"
-          git push || true
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          git commit -m "auto: update sent message history" || exit 0
+          git push
