@@ -12,9 +12,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_FILE = "state.json"
 
-# Timing constants for Zero-Downtime Continuous Loop
-MAX_AGE_SECONDS = 3 * 60  # Look back only 3 minutes max (strictly real-time)
-LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # Runs 4 hours 55 minutes cleanly
+# Timing constants
+MAX_AGE_SECONDS = 3 * 60  # 3 minutes for regular breaking news
+CALENDAR_MAX_AGE = 2 * 3600  # 2 hours for Economic Calendar (to bypass Finnhub's data delay)
+LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60 
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # Asset Tagging Keywords
@@ -72,7 +73,6 @@ def send_telegram_msg(text, image_url=None):
         return False
 
 def ensure_daily_date_header(state):
-    """Sends date banner ONLY when live news is about to post, and ONLY ONCE per day."""
     now_ist = datetime.now(timezone.utc) + IST_OFFSET
     today_str = now_ist.strftime("%d/%m/%Y")
     
@@ -118,7 +118,6 @@ def process_finnhub_news(state, now_ts):
 
         if matched_markets or any(kw in full_text for kw in HIGH_VOLATILITY_GEOPOLITICAL):
             ensure_daily_date_header(state)
-
             ist_time = (datetime.fromtimestamp(pub_time, tz=timezone.utc) + IST_OFFSET).strftime("%d %b %Y, %I:%M %p IST")
             markets_str = ", ".join(matched_markets) if matched_markets else "GENERAL MACRO"
 
@@ -159,16 +158,19 @@ def process_economic_calendar(state):
                 if event_time_str:
                     event_dt = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                     age = (now_utc - event_dt).total_seconds()
-                    if age > MAX_AGE_SECONDS or age < -120:
+                    
+                    # FIX 1: Allow up to 2 hours for Finnhub's API to update the 'actual' number.
+                    if age > CALENDAR_MAX_AGE or age < -300:
                         continue
 
                 country = event.get('country', '')
-                if country not in ['US', 'EU', 'NZ']:
+                # FIX 2: Added 'EA' and 'EMU' because Finnhub doesn't strictly use 'EU'.
+                if country not in ['US', 'EU', 'EA', 'EMU', 'NZ']:
                     continue
                 
                 markets = []
                 if country == 'US': markets.extend(["XAUUSD", "EURUSD", "NZDUSD", "US500"])
-                if country == 'EU': markets.append("EURUSD")
+                if country in ['EU', 'EA', 'EMU']: markets.append("EURUSD")
                 if country == 'NZ': markets.append("NZDUSD")
 
                 ensure_daily_date_header(state)
@@ -206,11 +208,10 @@ def process_eia_data(state):
             if not period:
                 return
 
-            # Skip EIA reports older than 3 days
             try:
                 period_dt = datetime.strptime(period, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 now_utc = datetime.now(timezone.utc)
-                if (now_utc - period_dt).days > 3:
+                if (now_utc - period_dt).days > 7:
                     if period not in state["sent_eia_periods"]:
                         state["sent_eia_periods"].append(period)
                         save_state(state)
@@ -241,17 +242,36 @@ def main():
     print("Starting Live News Engine...")
     state = load_state()
 
-    # Silent startup seed: heavily prevents older historical items from sending on runner startup
-    for cat in ["general", "forex"]:
-        try:
+    # Silent startup seed for Breaking News
+    try:
+        for cat in ["general", "forex"]:
             res = requests.get(f"https://finnhub.io/api/v1/news?category={cat}&token={FINNHUB_KEY}", timeout=10)
             if res.status_code == 200:
                 for item in res.json():
                     art_id = str(item.get("id") or item.get("url"))
                     if art_id not in state["sent_ids"]:
                         state["sent_ids"].append(art_id)
-        except Exception:
-            pass
+    except Exception:
+        pass
+        
+    # Silent startup seed for Economic Calendar
+    try:
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+        cal_url = f"https://finnhub.io/api/v1/calendar/economic?from={today_str}&to={today_str}&token={FINNHUB_KEY}"
+        res = requests.get(cal_url, timeout=10)
+        if res.status_code == 200:
+            for event in res.json().get("economicCalendar", []):
+                event_id = f"cal_{event.get('country')}_{event.get('event')}_{event.get('time')}"
+                if event_id not in state["sent_ids"] and event.get("actual") is not None:
+                    event_time_str = event.get("time", "")
+                    if event_time_str:
+                        event_dt = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        # Seed only if it's older than 10 minutes so we don't accidentally swallow a live drop
+                        if (now_utc - event_dt).total_seconds() > 600:
+                            state["sent_ids"].append(event_id)
+    except Exception:
+        pass
 
     try:
         eia_url = f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key={EIA_KEY}&frequency=weekly&data[0]=value&facets[series][]=WCRSTUS1&sort[0][column]=period&sort[0][direction]=desc&length=1"
