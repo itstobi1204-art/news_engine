@@ -4,9 +4,6 @@ on:
   schedule:
     - cron: '0 */5 * * *'
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -49,5 +46,5 @@ jobs:
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git pull origin main --rebase || true
           git add state.json
-          git commit -m "auto: update news state history" || exit 0
+          git commit -m "auto: update news state history [skip ci]" || exit 0
           git push
