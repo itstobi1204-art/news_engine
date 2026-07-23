@@ -30,27 +30,24 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                state = json.load(f)
-                if "sent_eia_periods" not in state:
-                    state["sent_eia_periods"] = []
-                if "sent_ids" not in state:
-                    state["sent_ids"] = []
-                if "initialized" not in state:
-                    state["initialized"] = True
-                return state
-        except Exception:
-            pass
-    # Cold start: initialized=False prevents sending old historical data on boot
-    return {"sent_ids": [], "last_date_sent": "", "sent_eia_periods": [], "initialized": False}
+                data = json.load(f)
+                return {
+                    "sent_ids": data.get("sent_ids", []),
+                    "last_date_sent": data.get("last_date_sent", ""),
+                    "sent_eia_periods": data.get("sent_eia_periods", [])
+                }
+        except Exception as e:
+            print(f"Error loading state file: {e}")
+    return {"sent_ids": [], "last_date_sent": "", "sent_eia_periods": []}
 
 def save_state(state):
-    if len(state["sent_ids"]) > 500:
+    try:
         state["sent_ids"] = state["sent_ids"][-500:]
-    if len(state["sent_eia_periods"]) > 50:
         state["sent_eia_periods"] = state["sent_eia_periods"][-50:]
-        
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"Error saving state file: {e}")
 
 def send_telegram_msg(text, image_url=None):
     if image_url:
@@ -61,7 +58,7 @@ def send_telegram_msg(text, image_url=None):
             if res.status_code == 200:
                 return True
         except Exception as e:
-            print(f"Image send failed, falling back to text: {e}")
+            print(f"Image send failed: {e}")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -73,7 +70,7 @@ def send_telegram_msg(text, image_url=None):
         return False
 
 def ensure_daily_date_header(state):
-    """Sends date banner ONLY when new news is ready to post, and ONLY ONCE per day."""
+    """Sends date banner ONLY when live news is about to post, and ONLY ONCE per day."""
     now_ist = datetime.now(timezone.utc) + IST_OFFSET
     today_str = now_ist.strftime("%d/%m/%Y")
     
@@ -84,10 +81,8 @@ def ensure_daily_date_header(state):
             save_state(state)
 
 def process_finnhub_news(state, now_ts):
-    """1. Fetches Text/Geopolitical Breaking News"""
     articles = []
-    categories = ["general", "forex"]
-    for cat in categories:
+    for cat in ["general", "forex"]:
         try:
             url = f"https://finnhub.io/api/v1/news?category={cat}&token={FINNHUB_KEY}"
             res = requests.get(url, timeout=10)
@@ -100,15 +95,9 @@ def process_finnhub_news(state, now_ts):
         article_id = str(item.get("id") or item.get("url"))
         pub_time = item.get("datetime", 0)
 
-        # Skip if already sent or older than 10 minutes
         if article_id in state["sent_ids"]:
             continue
         if (now_ts - pub_time) > MAX_AGE_SECONDS:
-            continue
-
-        # If bot is doing a cold boot, seed current news IDs without alerting
-        if not state.get("initialized", True):
-            state["sent_ids"].append(article_id)
             continue
 
         headline = item.get("headline", "")
@@ -150,7 +139,6 @@ def process_finnhub_news(state, now_ts):
                 save_state(state)
 
 def process_economic_calendar(state):
-    """2. Fetches Live Macro Economic Data (CPI, NFP, etc.)"""
     now_utc = datetime.now(timezone.utc)
     today_str = now_utc.strftime("%Y-%m-%d")
     url = f"https://finnhub.io/api/v1/calendar/economic?from={today_str}&to={today_str}&token={FINNHUB_KEY}"
@@ -171,11 +159,6 @@ def process_economic_calendar(state):
                     age = (now_utc - event_dt).total_seconds()
                     if age > MAX_AGE_SECONDS or age < -120:
                         continue
-
-                # Cold boot guard
-                if not state.get("initialized", True):
-                    state["sent_ids"].append(event_id)
-                    continue
 
                 country = event.get('country', '')
                 if country not in ['US', 'EU', 'NZ']:
@@ -205,7 +188,6 @@ def process_economic_calendar(state):
         print(f"Calendar Fetch Error: {e}")
 
 def process_eia_data(state):
-    """3. Fetches Official U.S. EIA Crude Oil Inventory"""
     url = f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key={EIA_KEY}&frequency=weekly&data[0]=value&facets[series][]=WCRSTUS1&sort[0][column]=period&sort[0][direction]=desc&length=1"
     
     try:
@@ -219,14 +201,22 @@ def process_eia_data(state):
             period = latest.get("period")
             value = latest.get("value")
             
-            if period and period not in state.get("sent_eia_periods", []):
-                # Cold boot guard: record existing EIA report silently on boot
-                if not state.get("initialized", True):
-                    state["sent_eia_periods"].append(period)
-                    save_state(state)
-                    print(f"Silently seeded EIA period {period}")
-                    return
+            if not period:
+                return
 
+            # Skip reports older than 3 days
+            try:
+                period_dt = datetime.strptime(period, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                if (now_utc - period_dt).days > 3:
+                    if period not in state["sent_eia_periods"]:
+                        state["sent_eia_periods"].append(period)
+                        save_state(state)
+                    return
+            except Exception:
+                pass
+
+            if period not in state.get("sent_eia_periods", []):
                 ensure_daily_date_header(state)
                 now_ist = datetime.now(timezone.utc) + IST_OFFSET
                 ist_time = now_ist.strftime("%d %b %Y, %I:%M %p IST")
@@ -248,23 +238,39 @@ def process_eia_data(state):
 def main():
     print("Starting Live News Engine...")
     state = load_state()
+
+    # Silent startup seed: prevents historical items from sending on runner startup
+    for cat in ["general", "forex"]:
+        try:
+            res = requests.get(f"https://finnhub.io/api/v1/news?category={cat}&token={FINNHUB_KEY}", timeout=10)
+            if res.status_code == 200:
+                for item in res.json():
+                    art_id = str(item.get("id") or item.get("url"))
+                    if art_id not in state["sent_ids"]:
+                        state["sent_ids"].append(art_id)
+        except Exception:
+            pass
+
+    try:
+        eia_url = f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key={EIA_KEY}&frequency=weekly&data[0]=value&facets[series][]=WCRSTUS1&sort[0][column]=period&sort[0][direction]=desc&length=1"
+        res = requests.get(eia_url, timeout=10)
+        if res.status_code == 200:
+            data_list = res.json().get("response", {}).get("data", [])
+            if data_list:
+                p = data_list[0].get("period")
+                if p and p not in state["sent_eia_periods"]:
+                    state["sent_eia_periods"].append(p)
+    except Exception:
+        pass
+
+    save_state(state)
+    print("Startup seed complete. Listening for live new events...")
+
     start_time = time.time()
-
-    # Perform initial seed run silently if cold boot
-    if not state.get("initialized", False):
-        print("Cold boot detected. Seeding current state to avoid duplicate old alerts...")
-        now_ts = time.time()
-        process_finnhub_news(state, now_ts)
-        process_economic_calendar(state)
-        process_eia_data(state)
-        state["initialized"] = True
-        save_state(state)
-        print("Initialization complete. Listening for live new events...")
-
     while (time.time() - start_time) < LOOP_DURATION_SECONDS:
         try:
-            now_ts = time.time()
-            process_finnhub_news(state, now_ts)
+            current_ts = time.time()
+            process_finnhub_news(state, current_ts)
             process_economic_calendar(state)
             process_eia_data(state)
         except Exception as e:
