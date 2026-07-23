@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 STATE_FILE = "state_general.json"
 
 # Timing constants
-MAX_AGE_SECONDS = 3 * 60  # 3 minutes for live breaking news
+MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer for Finnhub indexing delays
 LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
