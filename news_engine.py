@@ -11,8 +11,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_FILE = "state.json"
-MAX_AGE_SECONDS = 10 * 60  # Strictly ignore news older than 10 minutes
-LOOP_DURATION_SECONDS = 4 * 3600 + 50 * 60  # Runs 4 hrs 50 mins cleanly
+
+# Timing constants for Zero-Downtime Continuous Loop
+MAX_AGE_SECONDS = 3 * 60  # Look back only 3 minutes max (strictly real-time)
+LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # Runs 4 hours 55 minutes cleanly
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # Asset Tagging Keywords
@@ -204,7 +206,7 @@ def process_eia_data(state):
             if not period:
                 return
 
-            # Skip reports older than 3 days
+            # Skip EIA reports older than 3 days
             try:
                 period_dt = datetime.strptime(period, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 now_utc = datetime.now(timezone.utc)
@@ -239,7 +241,7 @@ def main():
     print("Starting Live News Engine...")
     state = load_state()
 
-    # Silent startup seed: prevents historical items from sending on runner startup
+    # Silent startup seed: heavily prevents older historical items from sending on runner startup
     for cat in ["general", "forex"]:
         try:
             res = requests.get(f"https://finnhub.io/api/v1/news?category={cat}&token={FINNHUB_KEY}", timeout=10)
@@ -264,7 +266,7 @@ def main():
         pass
 
     save_state(state)
-    print("Startup seed complete. Listening for live new events...")
+    print("Startup seed complete. Listening for live news events...")
 
     start_time = time.time()
     while (time.time() - start_time) < LOOP_DURATION_SECONDS:
@@ -277,7 +279,7 @@ def main():
             print(f"Loop error: {e}")
         time.sleep(3)
 
-    print("5-hour loop completed cleanly. Exiting to rotate runner.")
+    print("4h 55m continuous loop completed cleanly. Ready for GitHub hand-off.")
 
 if __name__ == "__main__":
     main()
