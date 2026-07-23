@@ -2,15 +2,16 @@ name: Live News Daemon
 
 on:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */5 * * *'  # Safety backup trigger
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write          # Allows the workflow to trigger itself
 
 concurrency:
   group: news-engine-daemon
-  cancel-in-progress: true
+  cancel-in-progress: false # Do not cancel while handing over
 
 jobs:
   run-live-daemon:
@@ -40,7 +41,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_engine.py
 
-      - name: Pull and Save State (Prevents Overwrite Conflicts)
+      - name: Trigger Next Continuous Runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Triggering next seamless runner..."
+          gh workflow run news.yml
+
+      - name: Pull and Save State
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
