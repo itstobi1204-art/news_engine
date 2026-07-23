@@ -2,16 +2,16 @@ name: Live News Daemon
 
 on:
   schedule:
-    - cron: '0 */5 * * *'  # Safety backup trigger
+    - cron: '0 */5 * * *'  # Backup cron trigger every 5 hours
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write          # Allows the workflow to trigger itself
+  actions: write          # Grants workflow re-trigger permissions
 
 concurrency:
   group: news-engine-daemon
-  cancel-in-progress: false # Do not cancel while handing over
+  cancel-in-progress: false
 
 jobs:
   run-live-daemon:
@@ -45,8 +45,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Triggering next seamless runner..."
-          gh workflow run news.yml
+          echo "Triggering next continuous runner..."
+          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || true
 
       - name: Pull and Save State
         run: |
@@ -55,4 +55,4 @@ jobs:
           git pull origin main --rebase || true
           git add state.json
           git commit -m "auto: update news state history [skip ci]" || exit 0
-          git push
+          git push || true
