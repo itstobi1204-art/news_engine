@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_FILE = "state.json"
-MAX_AGE_SECONDS = 15 * 60  # Look back up to 15 minutes (catches delayed reporting)
+MAX_AGE_SECONDS = 10 * 60  # Strictly ignore news older than 10 minutes
 LOOP_DURATION_SECONDS = 4 * 3600 + 50 * 60  # Runs 4 hrs 50 mins cleanly
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
@@ -31,16 +31,19 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 state = json.load(f)
-                # Ensure keys exist if it's an old state file
                 if "sent_eia_periods" not in state:
                     state["sent_eia_periods"] = []
+                if "sent_ids" not in state:
+                    state["sent_ids"] = []
+                if "initialized" not in state:
+                    state["initialized"] = True
                 return state
         except Exception:
             pass
-    return {"sent_ids": [], "last_date_sent": "", "sent_eia_periods": []}
+    # Cold start: initialized=False prevents sending old historical data on boot
+    return {"sent_ids": [], "last_date_sent": "", "sent_eia_periods": [], "initialized": False}
 
 def save_state(state):
-    # Truncate lists to prevent state.json from getting too large over time
     if len(state["sent_ids"]) > 500:
         state["sent_ids"] = state["sent_ids"][-500:]
     if len(state["sent_eia_periods"]) > 50:
@@ -70,7 +73,7 @@ def send_telegram_msg(text, image_url=None):
         return False
 
 def ensure_daily_date_header(state):
-    """Sends date banner ONLY when news is actually ready to be posted, and only ONCE a day."""
+    """Sends date banner ONLY when new news is ready to post, and ONLY ONCE per day."""
     now_ist = datetime.now(timezone.utc) + IST_OFFSET
     today_str = now_ist.strftime("%d/%m/%Y")
     
@@ -97,9 +100,15 @@ def process_finnhub_news(state, now_ts):
         article_id = str(item.get("id") or item.get("url"))
         pub_time = item.get("datetime", 0)
 
+        # Skip if already sent or older than 10 minutes
         if article_id in state["sent_ids"]:
             continue
         if (now_ts - pub_time) > MAX_AGE_SECONDS:
+            continue
+
+        # If bot is doing a cold boot, seed current news IDs without alerting
+        if not state.get("initialized", True):
+            state["sent_ids"].append(article_id)
             continue
 
         headline = item.get("headline", "")
@@ -151,22 +160,23 @@ def process_economic_calendar(state):
         if res.status_code == 200:
             events = res.json().get("economicCalendar", [])
             for event in events:
-                # Create a unique ID for the event
                 event_id = f"cal_{event.get('country')}_{event.get('event')}_{event.get('time')}"
                 
-                # Skip if already sent or if the actual data hasn't been released yet (None)
                 if event_id in state["sent_ids"] or event.get("actual") is None:
                     continue
                 
-                # Check if it was released within our time window
                 event_time_str = event.get("time", "")
                 if event_time_str:
                     event_dt = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                     age = (now_utc - event_dt).total_seconds()
-                    if age > MAX_AGE_SECONDS or age < -120:  # Allow slight future skew
+                    if age > MAX_AGE_SECONDS or age < -120:
                         continue
 
-                # Filter for major economies
+                # Cold boot guard
+                if not state.get("initialized", True):
+                    state["sent_ids"].append(event_id)
+                    continue
+
                 country = event.get('country', '')
                 if country not in ['US', 'EU', 'NZ']:
                     continue
@@ -210,6 +220,13 @@ def process_eia_data(state):
             value = latest.get("value")
             
             if period and period not in state.get("sent_eia_periods", []):
+                # Cold boot guard: record existing EIA report silently on boot
+                if not state.get("initialized", True):
+                    state["sent_eia_periods"].append(period)
+                    save_state(state)
+                    print(f"Silently seeded EIA period {period}")
+                    return
+
                 ensure_daily_date_header(state)
                 now_ist = datetime.now(timezone.utc) + IST_OFFSET
                 ist_time = now_ist.strftime("%d %b %Y, %I:%M %p IST")
@@ -232,6 +249,17 @@ def main():
     print("Starting Live News Engine...")
     state = load_state()
     start_time = time.time()
+
+    # Perform initial seed run silently if cold boot
+    if not state.get("initialized", False):
+        print("Cold boot detected. Seeding current state to avoid duplicate old alerts...")
+        now_ts = time.time()
+        process_finnhub_news(state, now_ts)
+        process_economic_calendar(state)
+        process_eia_data(state)
+        state["initialized"] = True
+        save_state(state)
+        print("Initialization complete. Listening for live new events...")
 
     while (time.time() - start_time) < LOOP_DURATION_SECONDS:
         try:
