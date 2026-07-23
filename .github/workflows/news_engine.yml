@@ -2,20 +2,16 @@ name: Live News Daemon
 
 on:
   schedule:
-    # Restarts the 5-hour loop automatically every 5 hours
+    # Runs automatically every 5 hours
     - cron: '0 */5 * * *'
-  # Allows manual start anytime from the GitHub Actions tab
   workflow_dispatch:
-  # Starts automatically whenever you push code changes to main
   push:
     branches:
       - main
 
-# Grant write permissions so the bot can commit updated state.json back to your repo
 permissions:
   contents: write
 
-# Prevent multiple duplicate runners from running at the same time
 concurrency:
   group: news-engine-daemon
   cancel-in-progress: true
@@ -23,7 +19,6 @@ concurrency:
 jobs:
   run-live-daemon:
     runs-on: ubuntu-latest
-    # GitHub maximum job limit is 360 min; set 320 min (5 hr 20 min) buffer for safety
     timeout-minutes: 320
 
     steps:
@@ -49,10 +44,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_engine.py
 
-      - name: Save Updated state.json
+      - name: Save Updated State (IDs & Dates)
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add state.json
-          git commit -m "auto: update sent message history" || exit 0
+          git commit -m "auto: update news state history" || exit 0
           git push
