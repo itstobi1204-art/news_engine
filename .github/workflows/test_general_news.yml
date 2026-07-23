@@ -1,0 +1,52 @@
+name: Test General News
+
+on:
+  workflow_dispatch:  # Manual button trigger only
+
+jobs:
+  run-general-news-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Requests
+        run: pip install requests
+
+      - name: Fetch General News and Send Telegram Alert
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import os, requests
+
+          finnhub_key = os.environ.get('FINNHUB_API_KEY')
+          bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+          chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+
+          url = f'https://finnhub.io/api/v1/news?category=general&token={finnhub_key}'
+          res = requests.get(url)
+
+          if res.status_code == 200 and len(res.json()) > 0:
+              latest = res.json()[0]
+              headline = latest.get('headline', 'No Headline')
+              summary = latest.get('summary', '')[:200]
+              article_url = latest.get('url', 'N/A')
+
+              msg = (
+                  f'🧪 <b>TEST GENERAL NEWS ALERT</b> 🧪\n\n'
+                  f'<b>Headline:</b> {headline}\n'
+                  f'<b>Summary:</b> {summary}...\n\n'
+                  f'<b>Link:</b> {article_url}'
+              )
+          else:
+              msg = f'❌ Test Failed. Finnhub HTTP Status: {res.status_code}'
+
+          tg_url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+          r = requests.post(tg_url, data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+          print('Telegram Status Code:', r.status_code)
+          "
