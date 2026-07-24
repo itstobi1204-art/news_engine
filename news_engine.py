@@ -3,8 +3,10 @@ import time
 import json
 import html
 import requests
+import trafilatura
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
+from playwright.sync_api import sync_playwright
 
 # Environment Variables
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
@@ -17,7 +19,7 @@ STATE_FILE = "state.json"
 # Timing constants
 MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer required for Finnhub indexing delays
 LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
-POLL_INTERVAL_SECONDS = 10  # Finnhub free tier = 60 calls/min; 10s keeps us at ~6 calls/min, plenty safe
+POLL_INTERVAL_SECONDS = 5  # 3 categories x 12 polls/min = 36 Finnhub calls/min, still under the 60/min ceiling
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # gemini-1.5-flash was shut down by Google (404s on every call).
@@ -66,16 +68,19 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 
-def scrape_article_details(article_url):
+def scrape_article_details(article_url, browser=None):
     cover_image = None
     body_text = ""
     if not article_url or article_url == "N/A":
         return cover_image, body_text
 
+    # Tier 1: fast static fetch + trafilatura (proper main-content extraction,
+    # strips ads/nav/related-articles junk far better than raw <p> joining)
     try:
         res = requests.get(article_url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
+            raw_html = res.text
+            soup = BeautifulSoup(raw_html, "html.parser")
             og_img = (
                 soup.find("meta", property="og:image")
                 or soup.find("meta", attrs={"name": "twitter:image"})
@@ -84,12 +89,39 @@ def scrape_article_details(article_url):
             if og_img and og_img.get("content"):
                 cover_image = og_img["content"]
 
-            paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 30]
-            body_text = " ".join(paragraphs[:8])
+            extracted = trafilatura.extract(raw_html, include_comments=False, include_tables=False)
+            if extracted:
+                body_text = extracted.strip()
         else:
             print(f"Scrape notice: {article_url} returned status {res.status_code}")
     except Exception as e:
         print(f"Scraper notice for {article_url}: {e}")
+
+    # Tier 2: static extraction came up thin - likely a JS-rendered site.
+    # Render it in a real (headless) browser and try extraction again.
+    if len(body_text) < 200 and browser is not None:
+        page = None
+        try:
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            page.set_default_timeout(15000)
+            page.goto(article_url, wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(800)  # let JS finish painting the article body
+            rendered_html = page.content()
+
+            extracted = trafilatura.extract(rendered_html, include_comments=False, include_tables=False)
+            if extracted and len(extracted) > len(body_text):
+                body_text = extracted.strip()
+
+            if not cover_image:
+                soup2 = BeautifulSoup(rendered_html, "html.parser")
+                og_img2 = soup2.find("meta", property="og:image")
+                if og_img2 and og_img2.get("content"):
+                    cover_image = og_img2["content"]
+        except Exception as e:
+            print(f"Headless render fallback failed for {article_url}: {e}")
+        finally:
+            if page:
+                page.close()
 
     return cover_image, body_text
 
@@ -128,7 +160,9 @@ def analyze_with_ai(headline, summary, body_text):
     1. Determine is_relevant per the rules above.
     2. Assign a Forex-Factory style impact colored circle: 🔴 High, 🟠 Medium, 🟡 Low, ⚪ Neutral.
     3. Select the SINGLE most relevant market tag from the Target Asset Scope list.
-    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. Do NOT repeat or paraphrase the headline.
+    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points based on the FULL ARTICLE TEXT
+       (not just the headline). Do NOT repeat or paraphrase the headline. If the article text is too
+       thin/empty to extract real detail, base the bullets on the summary instead and keep them general.
 
     Output strictly in JSON format without markdown wrapping:
     {{
@@ -141,7 +175,7 @@ def analyze_with_ai(headline, summary, body_text):
 
     HEADLINE: {headline}
     SUMMARY: {summary}
-    BODY TEXT: {body_text[:2000]}
+    FULL ARTICLE TEXT (may be partial if the source paywalled or blocked extraction): {body_text[:4000]}
     """
 
     payload = {
@@ -232,7 +266,7 @@ def fetch_finnhub_articles(category):
         return []
 
 
-def process_live_news(state, now_ts):
+def process_live_news(state, now_ts, browser=None):
     if not FINNHUB_KEY:
         print("Error: FINNHUB_API_KEY environment variable is missing.")
         return
@@ -264,7 +298,7 @@ def process_live_news(state, now_ts):
             article_url = item.get("url", "N/A")
             publisher = item.get("source", "Reuters")
 
-            scraped_img, body_text = scrape_article_details(article_url)
+            scraped_img, body_text = scrape_article_details(article_url, browser)
             final_image = scraped_img if scraped_img else item.get("image")
 
             ai_data = analyze_with_ai(headline, summary, body_text)
@@ -348,14 +382,40 @@ def main():
 
     print("Startup complete. Processing live market news...")
 
-    start_time = time.time()
-    while (time.time() - start_time) < LOOP_DURATION_SECONDS:
-        try:
-            current_ts = time.time()
-            process_live_news(state, current_ts)
-        except Exception as e:
-            print(f"Loop iteration error: {e}")
-        time.sleep(POLL_INTERVAL_SECONDS)
+    # One browser instance reused for the entire run (launching per-article would be very slow).
+    # If it fails to launch for any reason, fall back to static-only scraping rather than crashing.
+    playwright_ctx = None
+    browser = None
+    try:
+        playwright_ctx = sync_playwright().start()
+        browser = playwright_ctx.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        print("Headless browser ready for JS-rendered article fallback.")
+    except Exception as e:
+        print(f"Could not start headless browser ({e}) - continuing with static-only scraping.")
+
+    try:
+        start_time = time.time()
+        while (time.time() - start_time) < LOOP_DURATION_SECONDS:
+            try:
+                current_ts = time.time()
+                process_live_news(state, current_ts, browser)
+            except Exception as e:
+                print(f"Loop iteration error: {e}")
+            time.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright_ctx:
+            try:
+                playwright_ctx.stop()
+            except Exception:
+                pass
 
     print("4h 55m daemon cycle finished cleanly.")
 
@@ -363,22 +423,11 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-        
-        
-              
-            
     
-        
-    
-       
-
-        
+           
 
 
-       
 
 
-                        
 
-         
+   
