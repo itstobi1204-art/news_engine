@@ -17,12 +17,29 @@ STATE_FILE = "state.json"
 # Timing constants
 MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer required for Finnhub indexing delays
 LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
-POLL_INTERVAL_SECONDS = 30  # Finnhub free tier = 60 calls/min, so don't hammer it every 3s
+POLL_INTERVAL_SECONDS = 10  # Finnhub free tier = 60 calls/min; 10s keeps us at ~6 calls/min, plenty safe
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # gemini-1.5-flash was shut down by Google (404s on every call).
-# gemini-2.5-flash is the current stable, cheap, fast model as of mid-2026.
-GEMINI_MODEL = "gemini-2.5-flash"
+# gemini-2.5-flash-lite is built for high-volume classification tasks like this one,
+# with a meaningfully higher free-tier throughput ceiling than full gemini-2.5-flash.
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_RPM_LIMIT = 12  # stay a little under the free-tier per-minute ceiling as safety margin
+_gemini_call_times = []
+
+
+def _gemini_rate_limit_wait():
+    """Proactively self-throttle so we approach the RPM ceiling but rarely hit a 429."""
+    now = time.time()
+    # drop timestamps older than 60s
+    while _gemini_call_times and now - _gemini_call_times[0] > 60:
+        _gemini_call_times.pop(0)
+    if len(_gemini_call_times) >= GEMINI_RPM_LIMIT:
+        wait_for = 60 - (now - _gemini_call_times[0]) + 0.5
+        if wait_for > 0:
+            print(f"Gemini RPM budget reached ({GEMINI_RPM_LIMIT}/min) - pausing {wait_for:.1f}s to stay under the limit.")
+            time.sleep(wait_for)
+    _gemini_call_times.append(time.time())
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -90,12 +107,27 @@ def analyze_with_ai(headline, summary, body_text):
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
-    You are an elite Forex and Global Macro market analyst AI engine. Analyze the incoming headline and article body text.
-    Target Asset Scope: XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD.
+    You are an elite market analyst AI screening headlines for an ACTIVE DAY TRADER'S alert feed.
+    The trader cares ONLY about news that can move: forex majors, commodities, or stock indices,
+    or broader macro events (central bank decisions, inflation/jobs data, geopolitical shocks,
+    major earnings/M&A, energy supply news) that ripple into those markets.
 
-    1. Determine if this news is RELEVANT to macro/forex markets or the target assets.
+    Target Asset Scope (tag the SINGLE most relevant one):
+    - Forex: EURUSD, GBPUSD, USDJPY, NZDUSD, AUDUSD, USDCAD, USD (general dollar strength/policy)
+    - Commodities: XAUUSD (gold), XAGUSD (silver), USOIL, UKOIL
+    - Indices: US500 (S&P 500), US30 (Dow), NAS100 (Nasdaq)
+
+    RELEVANCE RULES:
+    - is_relevant = true: central bank/rate decisions, inflation/employment/GDP data, geopolitical
+      events affecting markets, oil/energy supply news, major index-moving earnings or M&A, currency
+      policy, commodity supply/demand shocks, major financial institution news.
+    - is_relevant = false: consumer products, lifestyle, entertainment, sports, local/regional stories
+      with no macro market impact, or anything not tied to the asset scope above — even if a company
+      name appears in it. Example of NOT relevant: a soft drink can size/price change in one country.
+
+    1. Determine is_relevant per the rules above.
     2. Assign a Forex-Factory style impact colored circle: 🔴 High, 🟠 Medium, 🟡 Low, ⚪ Neutral.
-    3. Select the SINGLE most relevant market tag from: [XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD].
+    3. Select the SINGLE most relevant market tag from the Target Asset Scope list.
     4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. Do NOT repeat or paraphrase the headline.
 
     Output strictly in JSON format without markdown wrapping:
@@ -114,33 +146,42 @@ def analyze_with_ai(headline, summary, body_text):
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2}
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+            "maxOutputTokens": 500,
+            # Gemini 2.5 Flash "thinks" by default and thinking tokens are deducted
+            # from the SAME budget as the actual answer. For a simple classification
+            # task this was silently eating the whole response (empty output -> your
+            # fallback text) and adding 5-30s of pure latency per article. Off = fast + reliable.
+            "thinkingConfig": {"thinkingBudget": 0}
+        }
     }
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            _gemini_rate_limit_wait()
             res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=15)
             if res.status_code == 200:
                 data = res.json()
                 text_response = data["candidates"][0]["content"]["parts"][0]["text"]
                 return json.loads(text_response)
             elif res.status_code == 429:
-                print(f"Gemini rate limit hit (429). Waiting 10s before retry {attempt + 1}/{max_retries}...")
-                time.sleep(10)
+                print(f"Gemini rate limit hit (429) despite throttling. Waiting 15s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(15)
                 continue
             else:
-                # This is what would have silently eaten every call under gemini-1.5-flash (404).
                 print(f"Gemini API Error {res.status_code}: {res.text[:300]}")
                 break
         except Exception as e:
             print(f"Gemini Request Failed: {e}")
             time.sleep(5)
 
-    return {
-        "is_relevant": True, "impact_emoji": "⚪", "market_symbol": "USD",
-        "bullet_1": headline, "bullet_2": "Detailed AI context temporarily unavailable."
-    }
+    # Genuine failure after retries: return None instead of a generic fallback.
+    # The caller will skip sending this article now and retry it automatically
+    # on the next poll (10s later) instead of blasting out an unfiltered/inaccurate alert.
+    return None
 
 
 def send_telegram_msg(formatted_text, image_url=None):
@@ -175,19 +216,37 @@ def send_telegram_msg(formatted_text, image_url=None):
         return False
 
 
+FINNHUB_CATEGORIES = ["general", "forex", "merger"]  # general covers commodities/indices/macro; forex = FX; merger = M&A moves
+
+
+def fetch_finnhub_articles(category):
+    url = f"https://finnhub.io/api/v1/news?category={category}&token={FINNHUB_KEY}"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            print(f"Finnhub error ({category}) {res.status_code}: {res.text[:300]}")
+            return []
+        return res.json()
+    except Exception as e:
+        print(f"Finnhub fetch failed ({category}): {e}")
+        return []
+
+
 def process_live_news(state, now_ts):
     if not FINNHUB_KEY:
         print("Error: FINNHUB_API_KEY environment variable is missing.")
         return
 
-    url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
     try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"Finnhub error {res.status_code}: {res.text[:300]}")
-            return
+        articles = []
+        seen_in_batch = set()
+        for category in FINNHUB_CATEGORIES:
+            for item in fetch_finnhub_articles(category):
+                art_id = str(item.get("id") or item.get("url"))
+                if art_id not in seen_in_batch:
+                    seen_in_batch.add(art_id)
+                    articles.append(item)
 
-        articles = res.json()
         new_count = 0
         for item in articles:
             article_id = str(item.get("id") or item.get("url"))
@@ -210,7 +269,13 @@ def process_live_news(state, now_ts):
 
             ai_data = analyze_with_ai(headline, summary, body_text)
 
-            if not ai_data or not ai_data.get("is_relevant", True):
+            if ai_data is None:
+                # Genuine AI failure (rate limit, outage, etc). Don't mark as sent -
+                # it stays eligible and will be retried automatically on the next poll.
+                print(f"AI analysis unavailable for '{headline}' right now - will retry next poll.")
+                continue
+
+            if not ai_data.get("is_relevant", True):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 continue
@@ -237,7 +302,7 @@ def process_live_news(state, now_ts):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
-                time.sleep(4.5)
+                time.sleep(1.5)
             else:
                 # Mark as sent anyway so a permanently-malformed article doesn't loop forever
                 # eating retries every 30s for the rest of the run.
@@ -265,11 +330,10 @@ def main():
 
     # Seed only items older than 1 hour on boot so recent items trigger IMMEDIATELY
     try:
-        res = requests.get(f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}", timeout=10)
-        if res.status_code == 200:
-            now_ts = time.time()
-            seeded = 0
-            for item in res.json():
+        now_ts = time.time()
+        seeded = 0
+        for category in FINNHUB_CATEGORIES:
+            for item in fetch_finnhub_articles(category):
                 art_id = str(item.get("id") or item.get("url"))
                 pub_time = item.get("datetime", 0)
                 # If article is older than 1 hour, ignore it. If newer, let it process!
@@ -277,10 +341,8 @@ def main():
                     if art_id not in state["sent_ids"]:
                         state["sent_ids"].append(art_id)
                         seeded += 1
-            save_state(state)
-            print(f"Boot seeding complete: marked {seeded} old articles as already-seen.")
-        else:
-            print(f"Boot seeding warning: Finnhub returned {res.status_code}")
+        save_state(state)
+        print(f"Boot seeding complete: marked {seeded} old articles as already-seen.")
     except Exception as e:
         print(f"Boot seeding warning: {e}")
 
@@ -300,3 +362,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+        
+        
+              
+            
+    
+        
+    
+       
+
+        
+
+
+       
+
+
+                        
+
+         
