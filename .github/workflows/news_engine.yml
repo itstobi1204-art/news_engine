@@ -1,14 +1,18 @@
 name: Live AI News Engine Daemon
+
 on:
   schedule:
-    - cron: '0 */5 * * *'  # Backup trigger every 5 hours, in case the self-chain breaks
+    - cron: '0 */4 * * *'  # Trigger every 4 hours as a backup runner
   workflow_dispatch:
+
 permissions:
   contents: write
   actions: write
+
 concurrency:
   group: news-engine-daemon
   cancel-in-progress: false
+
 jobs:
   run-live-daemon:
     runs-on: ubuntu-latest
@@ -26,10 +30,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright Browser
-        run: playwright install --with-deps chromium
+          pip install requests beautifulsoup4 trafilatura
 
       - name: Execute AI News Engine
         env:
@@ -39,15 +40,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_engine.py
 
-      # if: always() -> runs even if the engine step above crashed or timed out,
-      # so the daemon chain can't silently die for hours waiting on the backup cron.
       - name: Trigger Next Continuous Runner
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Triggering next continuous runner..."
-          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || echo "::warning::Failed to dispatch next run - relying on backup cron"
+          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || echo "::warning::Failed to dispatch next run"
 
       - name: Pull and Save State
         if: always()
@@ -58,5 +57,5 @@ jobs:
           if [ -f state.json ]; then
             git add state.json
             git commit -m "auto: update news state history [skip ci]" || echo "Nothing to commit"
-            git push || echo "::warning::Push failed - state changes from this run may be lost"
+            git push || echo "::warning::Push failed"
           fi
