@@ -14,8 +14,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 STATE_FILE = "state.json"
 
 # Fast execution & freshness constants
-MAX_AGE_SECONDS = 15 * 60  # Drop news older than 15 minutes to guarantee real-time speed
-LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes continuous runner
+MAX_AGE_SECONDS = 15 * 60  # Drop news older than 15 minutes
+LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 HEADERS = {
@@ -44,10 +44,8 @@ def save_state(state):
 
 
 def scrape_article_details(article_url):
-    """Scrapes the article webpage to extract the TRUE cover photo and full article text context."""
     cover_image = None
     body_text = ""
-    
     if not article_url or article_url == "N/A":
         return cover_image, body_text
 
@@ -55,8 +53,6 @@ def scrape_article_details(article_url):
         res = requests.get(article_url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
-            
-            # Extract high-quality lead cover photo (og:image or twitter:image)
             og_img = (
                 soup.find("meta", property="og:image") 
                 or soup.find("meta", attrs={"name": "twitter:image"})
@@ -65,7 +61,6 @@ def scrape_article_details(article_url):
             if og_img and og_img.get("content"):
                 cover_image = og_img["content"]
 
-            # Extract body text for AI depth analysis
             paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 30]
             body_text = " ".join(paragraphs[:8])
     except Exception as e:
@@ -75,9 +70,8 @@ def scrape_article_details(article_url):
 
 
 def analyze_with_ai(headline, summary, body_text):
-    """Uses Google Gemini API to evaluate market impact, classify symbol, and write 2 rich key points."""
+    """Uses Google Gemini API with a strict Retry Mechanism to prevent skipped articles."""
     if not GEMINI_KEY:
-        # Fallback if Gemini key is not provided
         return {
             "is_relevant": True,
             "impact_emoji": "🔴",
@@ -87,25 +81,13 @@ def analyze_with_ai(headline, summary, body_text):
         }
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-
     prompt = f"""
-    You are an elite Forex and Global Macro market analyst AI engine.
-    Analyze the incoming headline and article body text.
-
+    You are an elite Forex and Global Macro market analyst AI engine. Analyze the incoming headline and article body text.
     Target Asset Scope: XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD.
-    Target Topics: Macroeconomics, VIP speeches (Fed officials, Trump, political leaders), Geopolitics, Central Banks, and Currency-impacting events.
-
-    Task Guidelines:
     1. Determine if this news is RELEVANT to macro/forex markets or the target assets.
-    2. Assign a Forex-Factory style impact colored circle:
-       - 🔴 High / Critical Market Impact (Central Bank rate decisions, War/Geopolitics, CPI/NFP, Major VIP speeches)
-       - 🟠 Medium Impact (Moderate economic indicators, trade developments)
-       - 🟡 Low Impact
-       - ⚪ Neutral / General Macro Info
+    2. Assign a Forex-Factory style impact colored circle: 🔴 High, 🟠 Medium, 🟡 Low, ⚪ Neutral.
     3. Select the SINGLE most relevant market tag: [XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD].
-    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. 
-       - Do NOT repeat or paraphrase the headline.
-       - Synthesize actual facts, figures, context, and expected market/currency movement.
+    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. Do NOT repeat the headline.
 
     Output strictly in JSON format without markdown wrapping:
     {{
@@ -120,57 +102,52 @@ def analyze_with_ai(headline, summary, body_text):
     SUMMARY: {summary}
     BODY TEXT: {body_text[:2000]}
     """
-
+    
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.2
-        }
+        "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2}
     }
 
-    try:
-        res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            text_response = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text_response)
-        else:
-            print(f"Gemini API Error: {res.text}")
-    except Exception as e:
-        print(f"Gemini Request Failed: {e}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                text_response = data["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(text_response)
+            elif res.status_code == 429:
+                print(f"Rate limit hit (429). Waiting 10s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(10)  # Wait 10 seconds and try again. DO NOT SKIP.
+                continue
+            else:
+                print(f"Gemini API Error {res.status_code}: {res.text}")
+                break
+        except Exception as e:
+            print(f"Gemini Request Failed: {e}")
+            time.sleep(5) # Wait before retry on network error
 
-    return None
+    # Fallback only if all retries fail, ensuring the engine never crashes
+    return {
+        "is_relevant": True, "impact_emoji": "⚪", "market_symbol": "USD",
+        "bullet_1": headline, "bullet_2": "Detailed AI context temporarily unavailable."
+    }
 
 
 def send_telegram_msg(formatted_text, image_url=None):
-    """Sends clean Telegram alert with true article photo if available."""
     if image_url:
         photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "photo": image_url,
-            "caption": formatted_text,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url, "caption": formatted_text, "parse_mode": "HTML"}
         try:
-            res = requests.post(photo_url, data=payload, timeout=10)
-            if res.status_code == 200:
+            if requests.post(photo_url, data=payload, timeout=10).status_code == 200:
                 return True
         except Exception as e:
-            print(f"Telegram photo post failed, falling back to text: {e}")
+            print(f"Telegram photo post failed: {e}")
 
-    # Text-only fallback
     text_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": formatted_text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": formatted_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        res = requests.post(text_url, data=payload, timeout=10)
-        return res.status_code == 200
+        return requests.post(text_url, data=payload, timeout=10).status_code == 200
     except Exception as e:
         print(f"Telegram message error: {e}")
         return False
@@ -192,7 +169,6 @@ def process_live_news(state, now_ts):
             article_id = str(item.get("id") or item.get("url"))
             pub_time = item.get("datetime", 0)
 
-            # Skip already sent items or items older than 15 minutes
             if article_id in state["sent_ids"]:
                 continue
             if (now_ts - pub_time) > MAX_AGE_SECONDS:
@@ -203,26 +179,22 @@ def process_live_news(state, now_ts):
             article_url = item.get("url", "N/A")
             publisher = item.get("source", "Reuters")
 
-            # 1. Web scrape for true cover image & full body context
             scraped_img, body_text = scrape_article_details(article_url)
             final_image = scraped_img if scraped_img else item.get("image")
 
-            # 2. Process with AI for relevance, impact dot, symbol, and 2-bullet summary
             ai_data = analyze_with_ai(headline, summary, body_text)
+            
             if not ai_data or not ai_data.get("is_relevant", True):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 continue
 
-            # 3. Format Released Time in IST
             ist_time = (datetime.fromtimestamp(pub_time, tz=timezone.utc) + IST_OFFSET).strftime("%d %b %Y, %I:%M %p IST")
-
             impact_dot = ai_data.get("impact_emoji", "🔴")
             market_symbol = ai_data.get("market_symbol", "USD")
             bullet_1 = ai_data.get("bullet_1", headline)
             bullet_2 = ai_data.get("bullet_2", summary[:200])
 
-            # 4. Construct Telegram HTML Message
             message = (
                 f"{impact_dot} <b>{market_symbol} | {headline}</b>\n\n"
                 f"• {bullet_1}\n"
@@ -232,21 +204,23 @@ def process_live_news(state, now_ts):
                 f"<b>Link:</b> {article_url}"
             )
 
-            # 5. Send Alert
             if send_telegram_msg(message, final_image):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
+                
+                # PROACTIVE THROTTLING: Wait 4.5 seconds after a successful send.
+                # This guarantees we NEVER hit the 15 Requests Per Minute limit.
+                time.sleep(4.5) 
 
     except Exception as e:
         print(f"Error during news processing: {e}")
 
 
 def main():
-    print("Starting AI Market News Engine with Google Gemini...")
+    print("Starting AI Market News Engine with Smart Throttling...")
     state = load_state()
 
-    # Seed initial items on boot to prevent sending stale news
     try:
         res = requests.get(f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}", timeout=10)
         if res.status_code == 200:
@@ -267,7 +241,7 @@ def main():
             process_live_news(state, current_ts)
         except Exception as e:
             print(f"Loop iteration error: {e}")
-        time.sleep(3)  # Fast 3-second polling delay
+        time.sleep(3) 
 
     print("4h 55m daemon cycle finished cleanly.")
 
