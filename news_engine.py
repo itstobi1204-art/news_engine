@@ -13,8 +13,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_FILE = "state.json"
 
-# Fast execution & freshness constants
-MAX_AGE_SECONDS = 15 * 60  # Drop news older than 15 minutes
+# Timing constants
+MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer required for Finnhub indexing delays
 LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
@@ -70,7 +70,6 @@ def scrape_article_details(article_url):
 
 
 def analyze_with_ai(headline, summary, body_text):
-    """Uses Google Gemini API with a strict Retry Mechanism to prevent skipped articles."""
     if not GEMINI_KEY:
         return {
             "is_relevant": True,
@@ -84,10 +83,11 @@ def analyze_with_ai(headline, summary, body_text):
     prompt = f"""
     You are an elite Forex and Global Macro market analyst AI engine. Analyze the incoming headline and article body text.
     Target Asset Scope: XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD.
+    
     1. Determine if this news is RELEVANT to macro/forex markets or the target assets.
     2. Assign a Forex-Factory style impact colored circle: 🔴 High, 🟠 Medium, 🟡 Low, ⚪ Neutral.
-    3. Select the SINGLE most relevant market tag: [XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD].
-    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. Do NOT repeat the headline.
+    3. Select the SINGLE most relevant market tag from: [XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD].
+    4. Provide 2 CONCISE, HIGHLY INFORMATIVE executive bullet points. Do NOT repeat or paraphrase the headline.
 
     Output strictly in JSON format without markdown wrapping:
     {{
@@ -118,16 +118,15 @@ def analyze_with_ai(headline, summary, body_text):
                 return json.loads(text_response)
             elif res.status_code == 429:
                 print(f"Rate limit hit (429). Waiting 10s before retry {attempt + 1}/{max_retries}...")
-                time.sleep(10)  # Wait 10 seconds and try again. DO NOT SKIP.
+                time.sleep(10)
                 continue
             else:
                 print(f"Gemini API Error {res.status_code}: {res.text}")
                 break
         except Exception as e:
             print(f"Gemini Request Failed: {e}")
-            time.sleep(5) # Wait before retry on network error
+            time.sleep(5)
 
-    # Fallback only if all retries fail, ensuring the engine never crashes
     return {
         "is_relevant": True, "impact_emoji": "⚪", "market_symbol": "USD",
         "bullet_1": headline, "bullet_2": "Detailed AI context temporarily unavailable."
@@ -208,9 +207,6 @@ def process_live_news(state, now_ts):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
-                
-                # PROACTIVE THROTTLING: Wait 4.5 seconds after a successful send.
-                # This guarantees we NEVER hit the 15 Requests Per Minute limit.
                 time.sleep(4.5) 
 
     except Exception as e:
@@ -218,21 +214,26 @@ def process_live_news(state, now_ts):
 
 
 def main():
-    print("Starting AI Market News Engine with Smart Throttling...")
+    print("Starting AI Market News Engine...")
     state = load_state()
 
+    # Seed only items older than 1 hour on boot so recent items trigger IMMEDIATELY
     try:
         res = requests.get(f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}", timeout=10)
         if res.status_code == 200:
+            now_ts = time.time()
             for item in res.json():
                 art_id = str(item.get("id") or item.get("url"))
-                if art_id not in state["sent_ids"]:
-                    state["sent_ids"].append(art_id)
+                pub_time = item.get("datetime", 0)
+                # If article is older than 1 hour, ignore it. If newer, let it process!
+                if (now_ts - pub_time) > 3600:
+                    if art_id not in state["sent_ids"]:
+                        state["sent_ids"].append(art_id)
             save_state(state)
     except Exception as e:
         print(f"Boot seeding warning: {e}")
 
-    print("Startup seed complete. Listening continuously for fast market news...")
+    print("Startup complete. Processing live market news...")
 
     start_time = time.time()
     while (time.time() - start_time) < LOOP_DURATION_SECONDS:
