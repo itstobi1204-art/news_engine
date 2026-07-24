@@ -1,14 +1,13 @@
 import os
 import time
 import json
-import re
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 
 # Environment Variables
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -76,9 +75,9 @@ def scrape_article_details(article_url):
 
 
 def analyze_with_ai(headline, summary, body_text):
-    """Uses OpenAI to evaluate market impact, classify symbol, and write 2 rich, informative key points."""
-    if not OPENAI_KEY:
-        # Fallback if OpenAI key is not provided
+    """Uses Google Gemini API to evaluate market impact, classify symbol, and write 2 rich key points."""
+    if not GEMINI_KEY:
+        # Fallback if Gemini key is not provided
         return {
             "is_relevant": True,
             "impact_emoji": "🔴",
@@ -87,7 +86,9 @@ def analyze_with_ai(headline, summary, body_text):
             "bullet_2": summary[:200] if summary else "No further details available."
         }
 
-    system_prompt = """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+
+    prompt = f"""
     You are an elite Forex and Global Macro market analyst AI engine.
     Analyze the incoming headline and article body text.
 
@@ -106,37 +107,38 @@ def analyze_with_ai(headline, summary, body_text):
        - Do NOT repeat or paraphrase the headline.
        - Synthesize actual facts, figures, context, and expected market/currency movement.
 
-    Output strictly in JSON format:
-    {
+    Output strictly in JSON format without markdown wrapping:
+    {{
         "is_relevant": true,
         "impact_emoji": "🔴",
         "market_symbol": "XAUUSD",
         "bullet_1": "Executive detail on what occurred...",
         "bullet_2": "Market effect or fundamental impact direction..."
-    }
+    }}
+
+    HEADLINE: {headline}
+    SUMMARY: {summary}
+    BODY TEXT: {body_text[:2000]}
     """
 
-    user_content = f"HEADLINE: {headline}\nSUMMARY: {summary}\nBODY TEXT: {body_text[:2000]}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
+    }
 
     try:
-        res = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2
-            },
-            timeout=8
-        )
+        res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10)
         if res.status_code == 200:
-            return json.loads(res.json()["choices"][0]["message"]["content"])
+            data = res.json()
+            text_response = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text_response)
+        else:
+            print(f"Gemini API Error: {res.text}")
     except Exception as e:
-        print(f"OpenAI API Error: {e}")
+        print(f"Gemini Request Failed: {e}")
 
     return None
 
@@ -241,7 +243,7 @@ def process_live_news(state, now_ts):
 
 
 def main():
-    print("Starting AI Market News Engine...")
+    print("Starting AI Market News Engine with Google Gemini...")
     state = load_state()
 
     # Seed initial items on boot to prevent sending stale news
