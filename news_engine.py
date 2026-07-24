@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import html
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,12 @@ STATE_FILE = "state.json"
 # Timing constants
 MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer required for Finnhub indexing delays
 LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
+POLL_INTERVAL_SECONDS = 30  # Finnhub free tier = 60 calls/min, so don't hammer it every 3s
 IST_OFFSET = timedelta(hours=5, minutes=30)
+
+# gemini-1.5-flash was shut down by Google (404s on every call).
+# gemini-2.5-flash is the current stable, cheap, fast model as of mid-2026.
+GEMINI_MODEL = "gemini-2.5-flash"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -54,7 +60,7 @@ def scrape_article_details(article_url):
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
             og_img = (
-                soup.find("meta", property="og:image") 
+                soup.find("meta", property="og:image")
                 or soup.find("meta", attrs={"name": "twitter:image"})
                 or soup.find("meta", property="twitter:image")
             )
@@ -63,6 +69,8 @@ def scrape_article_details(article_url):
 
             paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 30]
             body_text = " ".join(paragraphs[:8])
+        else:
+            print(f"Scrape notice: {article_url} returned status {res.status_code}")
     except Exception as e:
         print(f"Scraper notice for {article_url}: {e}")
 
@@ -71,6 +79,7 @@ def scrape_article_details(article_url):
 
 def analyze_with_ai(headline, summary, body_text):
     if not GEMINI_KEY:
+        print("GEMINI_API_KEY not set - using fallback analysis (no AI summary).")
         return {
             "is_relevant": True,
             "impact_emoji": "🔴",
@@ -79,11 +88,11 @@ def analyze_with_ai(headline, summary, body_text):
             "bullet_2": summary[:200] if summary else "No further details available."
         }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
     You are an elite Forex and Global Macro market analyst AI engine. Analyze the incoming headline and article body text.
     Target Asset Scope: XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD.
-    
+
     1. Determine if this news is RELEVANT to macro/forex markets or the target assets.
     2. Assign a Forex-Factory style impact colored circle: 🔴 High, 🟠 Medium, 🟡 Low, ⚪ Neutral.
     3. Select the SINGLE most relevant market tag from: [XAUUSD, NZDUSD, EURUSD, US500, USOIL, USD].
@@ -102,7 +111,7 @@ def analyze_with_ai(headline, summary, body_text):
     SUMMARY: {summary}
     BODY TEXT: {body_text[:2000]}
     """
-    
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2}
@@ -117,11 +126,12 @@ def analyze_with_ai(headline, summary, body_text):
                 text_response = data["candidates"][0]["content"]["parts"][0]["text"]
                 return json.loads(text_response)
             elif res.status_code == 429:
-                print(f"Rate limit hit (429). Waiting 10s before retry {attempt + 1}/{max_retries}...")
+                print(f"Gemini rate limit hit (429). Waiting 10s before retry {attempt + 1}/{max_retries}...")
                 time.sleep(10)
                 continue
             else:
-                print(f"Gemini API Error {res.status_code}: {res.text}")
+                # This is what would have silently eaten every call under gemini-1.5-flash (404).
+                print(f"Gemini API Error {res.status_code}: {res.text[:300]}")
                 break
         except Exception as e:
             print(f"Gemini Request Failed: {e}")
@@ -134,19 +144,32 @@ def analyze_with_ai(headline, summary, body_text):
 
 
 def send_telegram_msg(formatted_text, image_url=None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured (missing bot token or chat id) - cannot send.")
+        return False
+
     if image_url:
         photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url, "caption": formatted_text, "parse_mode": "HTML"}
+        # Telegram caption limit is 1024 chars (vs 4096 for text messages)
+        caption = formatted_text if len(formatted_text) <= 1024 else formatted_text[:1000] + "..."
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url, "caption": caption, "parse_mode": "HTML"}
         try:
-            if requests.post(photo_url, data=payload, timeout=10).status_code == 200:
+            resp = requests.post(photo_url, data=payload, timeout=10)
+            if resp.status_code == 200:
                 return True
+            else:
+                print(f"Telegram photo send failed ({resp.status_code}): {resp.text[:300]} — falling back to text.")
         except Exception as e:
             print(f"Telegram photo post failed: {e}")
 
     text_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": formatted_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        return requests.post(text_url, data=payload, timeout=10).status_code == 200
+        resp = requests.post(text_url, data=payload, timeout=10)
+        if resp.status_code == 200:
+            return True
+        print(f"Telegram text send failed ({resp.status_code}): {resp.text[:300]}")
+        return False
     except Exception as e:
         print(f"Telegram message error: {e}")
         return False
@@ -161,9 +184,11 @@ def process_live_news(state, now_ts):
     try:
         res = requests.get(url, timeout=10)
         if res.status_code != 200:
+            print(f"Finnhub error {res.status_code}: {res.text[:300]}")
             return
 
         articles = res.json()
+        new_count = 0
         for item in articles:
             article_id = str(item.get("id") or item.get("url"))
             pub_time = item.get("datetime", 0)
@@ -172,6 +197,8 @@ def process_live_news(state, now_ts):
                 continue
             if (now_ts - pub_time) > MAX_AGE_SECONDS:
                 continue
+
+            new_count += 1
 
             headline = item.get("headline", "").strip()
             summary = item.get("summary", "").strip()
@@ -182,7 +209,7 @@ def process_live_news(state, now_ts):
             final_image = scraped_img if scraped_img else item.get("image")
 
             ai_data = analyze_with_ai(headline, summary, body_text)
-            
+
             if not ai_data or not ai_data.get("is_relevant", True):
                 state["sent_ids"].append(article_id)
                 save_state(state)
@@ -190,24 +217,36 @@ def process_live_news(state, now_ts):
 
             ist_time = (datetime.fromtimestamp(pub_time, tz=timezone.utc) + IST_OFFSET).strftime("%d %b %Y, %I:%M %p IST")
             impact_dot = ai_data.get("impact_emoji", "🔴")
-            market_symbol = ai_data.get("market_symbol", "USD")
-            bullet_1 = ai_data.get("bullet_1", headline)
-            bullet_2 = ai_data.get("bullet_2", summary[:200])
+            market_symbol = html.escape(str(ai_data.get("market_symbol", "USD")))
+            bullet_1 = html.escape(str(ai_data.get("bullet_1", headline)))
+            bullet_2 = html.escape(str(ai_data.get("bullet_2", summary[:200])))
+            safe_headline = html.escape(headline)
+            safe_publisher = html.escape(publisher)
+            safe_url = html.escape(article_url, quote=False)
 
             message = (
-                f"{impact_dot} <b>{market_symbol} | {headline}</b>\n\n"
+                f"{impact_dot} <b>{market_symbol} | {safe_headline}</b>\n\n"
                 f"• {bullet_1}\n"
                 f"• {bullet_2}\n\n"
                 f"<b>Released Time:</b> {ist_time}\n"
-                f"<b>Publisher:</b> {publisher}\n"
-                f"<b>Link:</b> {article_url}"
+                f"<b>Publisher:</b> {safe_publisher}\n"
+                f"<b>Link:</b> {safe_url}"
             )
 
             if send_telegram_msg(message, final_image):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
-                time.sleep(4.5) 
+                time.sleep(4.5)
+            else:
+                # Mark as sent anyway so a permanently-malformed article doesn't loop forever
+                # eating retries every 30s for the rest of the run.
+                state["sent_ids"].append(article_id)
+                save_state(state)
+                print(f"[{ist_time}] Alert FAILED to send (see error above), skipping: {headline}")
+
+        if new_count == 0:
+            print(f"No new qualifying articles this poll ({len(articles)} fetched from Finnhub).")
 
     except Exception as e:
         print(f"Error during news processing: {e}")
@@ -215,6 +254,13 @@ def process_live_news(state, now_ts):
 
 def main():
     print("Starting AI Market News Engine...")
+    if not FINNHUB_KEY:
+        print("WARNING: FINNHUB_API_KEY is not set.")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set.")
+    if not GEMINI_KEY:
+        print("WARNING: GEMINI_API_KEY is not set - AI analysis will be skipped (fallback only).")
+
     state = load_state()
 
     # Seed only items older than 1 hour on boot so recent items trigger IMMEDIATELY
@@ -222,6 +268,7 @@ def main():
         res = requests.get(f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}", timeout=10)
         if res.status_code == 200:
             now_ts = time.time()
+            seeded = 0
             for item in res.json():
                 art_id = str(item.get("id") or item.get("url"))
                 pub_time = item.get("datetime", 0)
@@ -229,7 +276,11 @@ def main():
                 if (now_ts - pub_time) > 3600:
                     if art_id not in state["sent_ids"]:
                         state["sent_ids"].append(art_id)
+                        seeded += 1
             save_state(state)
+            print(f"Boot seeding complete: marked {seeded} old articles as already-seen.")
+        else:
+            print(f"Boot seeding warning: Finnhub returned {res.status_code}")
     except Exception as e:
         print(f"Boot seeding warning: {e}")
 
@@ -242,7 +293,7 @@ def main():
             process_live_news(state, current_ts)
         except Exception as e:
             print(f"Loop iteration error: {e}")
-        time.sleep(3) 
+        time.sleep(POLL_INTERVAL_SECONDS)
 
     print("4h 55m daemon cycle finished cleanly.")
 
