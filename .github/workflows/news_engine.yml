@@ -1,23 +1,18 @@
 name: Live AI News Engine Daemon
-
 on:
   schedule:
-    - cron: '0 */5 * * *'  # Backup trigger every 5 hours
+    - cron: '0 */5 * * *'  # Backup trigger every 5 hours, in case the self-chain breaks
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 concurrency:
   group: news-engine-daemon
   cancel-in-progress: false
-
 jobs:
   run-live-daemon:
     runs-on: ubuntu-latest
     timeout-minutes: 320
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -41,18 +36,24 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_engine.py
 
+      # if: always() -> runs even if the engine step above crashed or timed out,
+      # so the daemon chain can't silently die for hours waiting on the backup cron.
       - name: Trigger Next Continuous Runner
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Triggering next continuous runner..."
-          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || true
+          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || echo "::warning::Failed to dispatch next run - relying on backup cron"
 
       - name: Pull and Save State
+        if: always()
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git pull origin main --rebase || true
-          git add state.json
-          git commit -m "auto: update news state history [skip ci]" || exit 0
-          git push || true
+          if [ -f state.json ]; then
+            git add state.json
+            git commit -m "auto: update news state history [skip ci]" || echo "Nothing to commit"
+            git push || echo "::warning::Push failed - state changes from this run may be lost"
+          fi
