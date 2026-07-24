@@ -28,6 +28,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Playwright Browser
+        run: playwright install --with-deps chromium
+
       - name: Execute AI News Engine
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
