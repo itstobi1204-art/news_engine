@@ -26,25 +26,26 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 # these keyword groups. Safer than an AI fallback that defaults to "send everything."
 
 FOREX_KEYWORDS = {
-    "EURUSD": ["euro", "eurozone", "ecb", "european central bank"],
-    "GBPUSD": ["pound sterling", "bank of england", " boe ", "sterling"],
-    "USDJPY": [" yen", "bank of japan", " boj "],
-    "NZDUSD": ["new zealand dollar", "rbnz"],
-    "AUDUSD": ["australian dollar", " rba "],
-    "USDCAD": ["canadian dollar", "bank of canada", " boc "],
+    "EURUSD": ["euro", "eurozone", "ecb", "european central bank", "eur/usd", "eurusd", " eur "],
+    "GBPUSD": ["pound sterling", "bank of england", " boe ", "sterling", "gbp/usd", "gbpusd", " gbp ", "british pound"],
+    "USDJPY": [" yen", "bank of japan", " boj ", "usd/jpy", "usdjpy"],
+    "NZDUSD": ["new zealand dollar", "rbnz", "nzd/usd", "nzdusd", " nzd "],
+    "AUDUSD": ["australian dollar", " rba ", "aud/usd", "audusd", " aud "],
+    "USDCAD": ["canadian dollar", "bank of canada", " boc ", "usd/cad", "usdcad"],
 }
 
 COMMODITY_KEYWORDS = {
-    "XAUUSD": ["gold price", "gold prices", "gold rose", "gold fell", "bullion", "gold rally", "gold surge"],
-    "XAGUSD": ["silver price", "silver prices"],
-    "USOIL": ["crude oil", " wti ", "opec", "oil price", "oil prices", "per barrel"],
-    "UKOIL": ["brent crude", "brent oil"],
+    "XAUUSD": ["gold price", "gold prices", "gold rose", "gold fell", "bullion", "gold rally",
+               "gold surge", "gold ", "xau/usd", "xauusd"],
+    "XAGUSD": ["silver price", "silver prices", "silver ", "xag/usd", "xagusd"],
+    "USOIL": ["crude oil", " wti ", "opec", "oil price", "oil prices", "per barrel", " oil "],
+    "UKOIL": ["brent crude", "brent oil", "brent "],
 }
 
 INDEX_KEYWORDS = {
-    "US500": ["s&p 500", "s&p500", "sp500"],
-    "US30": ["dow jones", "dow industrial"],
-    "NAS100": ["nasdaq"],
+    "US500": ["s&p 500", "s&p500", "sp500", " spx ", " spy "],
+    "US30": ["dow jones", "dow industrial", " djia "],
+    "NAS100": ["nasdaq", " ndx ", " qqq "],
 }
 
 MACRO_KEYWORDS = {
@@ -53,6 +54,18 @@ MACRO_KEYWORDS = {
         "inflation", " cpi ", "consumer price index", "nonfarm payroll", "non-farm payroll",
         "jobs report", "unemployment rate", " gdp ", "treasury yield", "treasury yields",
         "powell", "central bank", "recession", "tariff", "trade war", "sanctions",
+        "stock market", "wall street", "global markets", "equity markets", "risk-off",
+        "risk-on", "safe haven", "volatility", "dollar index", " dxy ",
+    ]
+}
+
+# Finnhub's 'merger' category doesn't naturally use any of the keywords above,
+# so every M&A article was being silently rejected. M&A moves the indices this
+# feed is supposed to cover, so it gets its own group.
+MERGER_KEYWORDS = {
+    "US500": [
+        "acquisition", "acquire", "acquires", "acquiring", "merger", "merges",
+        "buyout", "takeover", "to buy", "to acquire", "deal to buy", "definitive agreement",
     ]
 }
 
@@ -66,7 +79,7 @@ MEDIUM_IMPACT_KEYWORDS = [
     "tariff", "crude oil", "gold price",
 ]
 
-_ALL_CATEGORY_GROUPS = [FOREX_KEYWORDS, COMMODITY_KEYWORDS, INDEX_KEYWORDS, MACRO_KEYWORDS]
+_ALL_CATEGORY_GROUPS = [FOREX_KEYWORDS, COMMODITY_KEYWORDS, INDEX_KEYWORDS, MACRO_KEYWORDS, MERGER_KEYWORDS]
 
 
 def _extract_bullets(headline, summary, body_text):
@@ -398,3 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
