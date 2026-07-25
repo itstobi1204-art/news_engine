@@ -112,8 +112,17 @@ def classify_article(headline, summary, body_text):
         if matched_symbol:
             break
 
+    # No specific match -> still send it, just tagged as general/neutral instead
+    # of a specific instrument. Nothing gets silently dropped anymore.
     if not matched_symbol:
-        return {"is_relevant": False}
+        bullet_1, bullet_2 = _extract_bullets(headline, summary, body_text)
+        return {
+            "is_relevant": True,
+            "impact_emoji": "⚪",
+            "market_symbol": "GENERAL",
+            "bullet_1": bullet_1,
+            "bullet_2": bullet_2,
+        }
 
     if any(kw in haystack for kw in HIGH_IMPACT_KEYWORDS):
         impact_emoji = "🔴"
