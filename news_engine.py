@@ -258,6 +258,14 @@ def send_telegram_msg(formatted_text, image_url=None):
 
 FINNHUB_CATEGORIES = ["general", "forex", "merger"]  # general covers commodities/indices/macro; forex = FX; merger = M&A moves
 
+# No API key, no rate limit tier, nothing to exhaust - these are publisher RSS feeds
+# dedicated to live market news, often faster than Finnhub's own indexing delay.
+RSS_FEEDS = {
+    "https://www.investing.com/rss/news_1.rss": "Investing.com (Forex)",
+    "https://www.investing.com/rss/news_11.rss": "Investing.com (Commodities)",
+    "https://investinglive.com/rss": "investingLive",
+}
+
 
 def fetch_finnhub_articles(category):
     url = f"https://finnhub.io/api/v1/news?category={category}&token={FINNHUB_KEY}"
@@ -272,6 +280,52 @@ def fetch_finnhub_articles(category):
         return []
 
 
+def fetch_rss_articles(feed_url, source_name):
+    """Returns items normalized to the same shape Finnhub items use, so they flow
+    through the exact same scrape/classify/send pipeline with no special-casing."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        res = requests.get(feed_url, headers=HEADERS, timeout=10)
+        if res.status_code != 200:
+            print(f"RSS error ({source_name}) {res.status_code}")
+            return []
+
+        root = ET.fromstring(res.content)
+        items = []
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            description = (item.findtext("description") or "").strip()
+            pub_date_str = item.findtext("pubDate")
+
+            pub_ts = 0
+            if pub_date_str:
+                for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
+                    try:
+                        pub_ts = datetime.strptime(pub_date_str, fmt).timestamp()
+                        break
+                    except ValueError:
+                        continue
+
+            if not link or not title:
+                continue
+
+            items.append({
+                "id": f"rss_{hash(link)}",
+                "datetime": int(pub_ts),
+                "headline": title,
+                "summary": description,
+                "url": link,
+                "source": source_name,
+                "image": None,
+            })
+        return items
+    except Exception as e:
+        print(f"RSS fetch failed ({source_name}): {e}")
+        return []
+
+
 def process_live_news(state, now_ts, browser=None):
     if not FINNHUB_KEY:
         print("Error: FINNHUB_API_KEY environment variable is missing.")
@@ -282,6 +336,13 @@ def process_live_news(state, now_ts, browser=None):
         seen_in_batch = set()
         for category in FINNHUB_CATEGORIES:
             for item in fetch_finnhub_articles(category):
+                art_id = str(item.get("id") or item.get("url"))
+                if art_id not in seen_in_batch:
+                    seen_in_batch.add(art_id)
+                    articles.append(item)
+
+        for feed_url, source_name in RSS_FEEDS.items():
+            for item in fetch_rss_articles(feed_url, source_name):
                 art_id = str(item.get("id") or item.get("url"))
                 if art_id not in seen_in_batch:
                     seen_in_batch.add(art_id)
@@ -420,3 +481,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
