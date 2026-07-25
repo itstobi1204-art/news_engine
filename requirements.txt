@@ -5,3 +5,7 @@ python-dotenv
 beautifulsoup4
 trafilatura
 playwright
+requests
+beautifulsoup4
+trafilatura
+playwright
