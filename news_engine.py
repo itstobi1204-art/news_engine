@@ -301,15 +301,22 @@ RSS_FEEDS = {
 
 def fetch_finnhub_articles(category):
     url = f"https://finnhub.io/api/v1/news?category={category}&token={FINNHUB_KEY}"
-    for attempt in range(2):  # one retry - a single timeout shouldn't cost us the whole poll
+    for attempt in range(3):  # GitHub Actions' shared IPs occasionally get a transient
+                              # Cloudflare-level 502 that a residential IP wouldn't see -
+                              # a short backoff clears this far more reliably than a bare retry.
         try:
             res = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if res.status_code != 200:
-                print(f"Finnhub error ({category}) {res.status_code}: {res.text[:300]}")
-                return []
-            return res.json()
+            if res.status_code == 200:
+                return res.json()
+            if res.status_code >= 500 and attempt < 2:
+                print(f"Finnhub {res.status_code} ({category}) - transient, retrying in {2 * (attempt + 1)}s...")
+                time.sleep(2 * (attempt + 1))
+                continue
+            print(f"Finnhub error ({category}) {res.status_code}: {res.text[:200]}")
+            return []
         except Exception as e:
-            if attempt == 0:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
                 continue
             print(f"Finnhub fetch failed ({category}): {e}")
             return []
