@@ -189,6 +189,38 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 
+def _resolve_google_news_redirect(article_url, browser=None):
+    """Google News article links are usually redirect stubs, not real article pages.
+    Some resolve via a plain HTTP redirect (fast path); others require executing
+    JS client-side (need the headless browser). Try both before giving up - a real
+    resolved article means real text and a real image instead of nothing."""
+    # Fast path: plain HTTP follow
+    try:
+        res = requests.get(article_url, headers=HEADERS, timeout=8, allow_redirects=True)
+        if res.status_code == 200 and "news.google.com" not in res.url:
+            return res.url, res.text
+    except Exception:
+        pass
+
+    # Slow path: needs real JS execution to redirect
+    if browser is not None:
+        page = None
+        try:
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            page.set_default_timeout(10000)
+            page.goto(article_url, wait_until="networkidle", timeout=10000)
+            resolved_url = page.url
+            if "news.google.com" not in resolved_url:
+                return resolved_url, page.content()
+        except Exception:
+            pass
+        finally:
+            if page:
+                page.close()
+
+    return None, None
+
+
 def scrape_article_details(article_url, browser=None):
     cover_image = None
     body_text = ""
@@ -196,13 +228,35 @@ def scrape_article_details(article_url, browser=None):
         return cover_image, body_text
 
     # Google News redirect links (used for licensed wire-service redistribution,
-    # e.g. Reuters via aggregator feeds) aren't real article pages - they're
-    # tracking/redirect stubs. Scraping them either times out, or "succeeds" by
-    # extracting garbage (duplicated headline as body text) and a generic Google
-    # News icon as the "image". Skip scraping entirely for these; the RSS
-    # summary/description is a better source of truth than anything we'd extract here.
+    # e.g. Reuters via aggregator feeds) aren't real article pages. Try to resolve
+    # to the actual underlying article first - if that works, extract from it
+    # normally below. If it genuinely can't be resolved, there's nothing to scrape;
+    # the RSS summary is a better source of truth than a broken redirect stub.
     if "news.google.com" in article_url:
-        return None, ""
+        resolved_url, resolved_html = _resolve_google_news_redirect(article_url, browser)
+        if not resolved_url:
+            return None, ""
+        article_url = resolved_url
+        # fall through to Tier 1 below, but reuse the HTML we already fetched
+        # instead of a third network round-trip
+        try:
+            soup = BeautifulSoup(resolved_html, "html.parser")
+            og_img = (
+                soup.find("meta", property="og:image")
+                or soup.find("meta", attrs={"name": "twitter:image"})
+                or soup.find("meta", property="twitter:image")
+            )
+            if og_img and og_img.get("content"):
+                cover_image = og_img["content"]
+            extracted = trafilatura.extract(resolved_html, include_comments=False, include_tables=False)
+            if extracted:
+                body_text = extracted.strip()
+        except Exception as e:
+            print(f"Resolved-redirect extraction failed for {article_url}: {e}")
+        if body_text:
+            return cover_image, body_text
+        # thin result even after resolving - still worth trying tier 2 below with
+        # the resolved URL rather than the dead-end google.com stub
 
     # Tier 1: fast static fetch + trafilatura (proper main-content extraction,
     # strips ads/nav/related-articles junk far better than raw <p> joining)
@@ -418,8 +472,8 @@ def process_live_news(state, now_ts, browser=None):
             publisher = item.get("source", "Reuters")
 
             scraped_img, body_text = scrape_article_details(article_url, browser)
-            is_redirect_link = "news.google.com" in article_url
-            final_image = None if is_redirect_link else (scraped_img if scraped_img else item.get("image"))
+            unresolved_redirect = "news.google.com" in article_url and not scraped_img
+            final_image = None if unresolved_redirect else (scraped_img if scraped_img else item.get("image"))
 
             classification = classify_article(headline, summary, body_text)
 
