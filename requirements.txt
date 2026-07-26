@@ -3,3 +3,4 @@ beautifulsoup4
 trafilatura
 playwright
 python-dotenv
+googlenewsdecoder
