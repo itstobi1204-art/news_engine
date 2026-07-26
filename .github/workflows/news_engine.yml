@@ -1,8 +1,14 @@
 name: Live AI News Engine Daemon
 on:
-  schedule:
-    - cron: '30 */6 * * *'  # Backup only - offset+spaced further out so it rarely lands mid-run
-  workflow_dispatch:
+  workflow_dispatch:  # No more cron backup - it was the source of every collision
+                       # we've seen (cron firing mid-run, racing the self-chain, and
+                       # the singleton guard couldn't reliably catch the timing race).
+                       # Self-chaining alone has run cleanly every time in practice.
+                       # Trade-off: if the self-chain dispatch step ever genuinely
+                       # fails, there's no automatic backup anymore - you'd need to
+                       # manually hit "Run workflow" to restart it. That's a rare,
+                       # visible failure (you'd notice the run list stop moving)
+                       # rather than the frequent silent collisions cron caused.
 permissions:
   contents: write
   actions: write
@@ -66,7 +72,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Triggering next continuous runner..."
-          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || echo "::warning::Failed to dispatch next run - relying on backup cron"
+          gh workflow run "${{ github.workflow }}" || gh workflow run news_engine.yml || echo "::warning::Failed to dispatch next run - the chain has stopped, you'll need to manually click Run workflow to restart it"
 
       - name: Pull and Save State
         if: always() && env.SKIP != 'true'
