@@ -190,17 +190,38 @@ def save_state(state):
 
 
 def _resolve_google_news_redirect(article_url, browser=None):
-    """Google News article links are usually redirect stubs, not real article pages.
-    Some resolve via a plain HTTP redirect (fast path); others require executing
-    JS client-side (need the headless browser). Try both before giving up - a real
-    resolved article means real text and a real image instead of nothing."""
+    """Google News article links are redirect stubs, not real article pages.
+    Try, in order of reliability:
+    1. googlenewsdecoder - calls Google's own internal decode endpoint directly
+       (the same mechanism their JS uses), so it isn't a "browser" Google can bot-detect.
+    2. Plain HTTP follow - works for the subset that redirect via a normal 30x.
+    3. Headless browser - needs real JS execution, but Google actively fingerprints
+       and blocks automated browsers, so this is the least reliable of the three."""
+    try:
+        from googlenewsdecoder import new_decoderv1
+        result = new_decoderv1(article_url, interval=1)
+        if result.get("status") and result.get("decoded_url"):
+            real_url = result["decoded_url"]
+            print(f"Google redirect resolved (decoder): {real_url}")
+            res = requests.get(real_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            if res.status_code == 200:
+                return real_url, res.text
+        else:
+            print(f"Google redirect decoder returned no result: {result}")
+    except ImportError:
+        print("googlenewsdecoder not installed - falling back to HTTP/browser resolution.")
+    except Exception as e:
+        print(f"Google redirect decoder failed: {e}")
+
     # Fast path: plain HTTP follow
     try:
         res = requests.get(article_url, headers=HEADERS, timeout=8, allow_redirects=True)
         if res.status_code == 200 and "news.google.com" not in res.url:
+            print(f"Google redirect resolved (HTTP): {res.url}")
             return res.url, res.text
-    except Exception:
-        pass
+        print(f"Google redirect fast-path did not escape google.com (status {res.status_code}) - trying browser.")
+    except Exception as e:
+        print(f"Google redirect fast-path failed: {e}")
 
     # Slow path: needs real JS execution to redirect
     if browser is not None:
@@ -211,12 +232,16 @@ def _resolve_google_news_redirect(article_url, browser=None):
             page.goto(article_url, wait_until="networkidle", timeout=10000)
             resolved_url = page.url
             if "news.google.com" not in resolved_url:
+                print(f"Google redirect resolved (browser): {resolved_url}")
                 return resolved_url, page.content()
-        except Exception:
-            pass
+            print(f"Google redirect browser attempt still on google.com ({resolved_url}) - likely bot-blocked, giving up.")
+        except Exception as e:
+            print(f"Google redirect browser attempt failed: {e}")
         finally:
             if page:
                 page.close()
+    else:
+        print("Google redirect: no browser available for JS-redirect attempt.")
 
     return None, None
 
