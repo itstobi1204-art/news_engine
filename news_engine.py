@@ -8,6 +8,18 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
+# Running on GitHub Actions? It sets this env var automatically - we use it to tell
+# CI mode (bounded ~5h loop, secrets from GH Secrets) apart from local mode
+# (loop forever, credentials from a .env file since there's no GH Secrets locally).
+RUNNING_IN_CI = os.getenv("GITHUB_ACTIONS") == "true"
+
+if not RUNNING_IN_CI:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()  # reads a .env file sitting next to this script, if present
+    except ImportError:
+        pass  # dotenv not installed - fine, will just read real OS env vars instead
+
 # Environment Variables
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -17,8 +29,13 @@ STATE_FILE = "state.json"
 
 # Timing constants
 MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer required for Finnhub indexing delays
-LOOP_DURATION_SECONDS = 4 * 3600 + 55 * 60  # 4 hours 55 minutes
-POLL_INTERVAL_SECONDS = 5  # 3 categories x 12 polls/min = 36 Finnhub calls/min, still under the 60/min ceiling
+# On GitHub Actions we must stop before the 6-hour job limit and hand off to the next
+# self-triggered run. Running locally has no such limit, so just loop forever.
+LOOP_DURATION_SECONDS = (4 * 3600 + 55 * 60) if RUNNING_IN_CI else float("inf")
+POLL_INTERVAL_SECONDS = 15  # 5s was too aggressive - real-world testing showed it triggering
+                             # timeouts/throttling on Finnhub and investingLive from sustained
+                             # rapid-fire requests. 15s is still fast for news alerts and far gentler.
+REQUEST_TIMEOUT = 15  # was 10s - too tight under normal network variance, caused false failures
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # --- Rule-based day-trader relevance classifier (no AI, fully deterministic) ---
@@ -92,7 +109,13 @@ def _extract_bullets(headline, summary, body_text):
     # crude sentence split, good enough for extractive bullets
     sentences = [s.strip() for s in source_text.replace("\n", " ").split(". ") if len(s.strip()) > 20]
     bullet_1 = sentences[0][:220] if len(sentences) > 0 else headline
-    bullet_2 = sentences[1][:220] if len(sentences) > 1 else (summary[:220] if summary else "No further details available.")
+    bullet_1_normalized = bullet_1.strip().rstrip(".!?").lower()
+    if len(sentences) > 1:
+        bullet_2 = sentences[1][:220]
+    elif summary and summary[:220].strip().rstrip(".!?").lower() != bullet_1_normalized:
+        bullet_2 = summary[:220]
+    else:
+        bullet_2 = "No further detail available from the source feed."
     if not bullet_1.endswith((".", "!", "?")):
         bullet_1 += "."
     if not bullet_2.endswith((".", "!", "?")):
@@ -172,10 +195,19 @@ def scrape_article_details(article_url, browser=None):
     if not article_url or article_url == "N/A":
         return cover_image, body_text
 
+    # Google News redirect links (used for licensed wire-service redistribution,
+    # e.g. Reuters via aggregator feeds) aren't real article pages - they're
+    # tracking/redirect stubs. Scraping them either times out, or "succeeds" by
+    # extracting garbage (duplicated headline as body text) and a generic Google
+    # News icon as the "image". Skip scraping entirely for these; the RSS
+    # summary/description is a better source of truth than anything we'd extract here.
+    if "news.google.com" in article_url:
+        return None, ""
+
     # Tier 1: fast static fetch + trafilatura (proper main-content extraction,
     # strips ads/nav/related-articles junk far better than raw <p> joining)
     try:
-        res = requests.get(article_url, headers=HEADERS, timeout=6)
+        res = requests.get(article_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if res.status_code == 200:
             raw_html = res.text
             soup = BeautifulSoup(raw_html, "html.parser")
@@ -269,15 +301,19 @@ RSS_FEEDS = {
 
 def fetch_finnhub_articles(category):
     url = f"https://finnhub.io/api/v1/news?category={category}&token={FINNHUB_KEY}"
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"Finnhub error ({category}) {res.status_code}: {res.text[:300]}")
+    for attempt in range(2):  # one retry - a single timeout shouldn't cost us the whole poll
+        try:
+            res = requests.get(url, timeout=REQUEST_TIMEOUT)
+            if res.status_code != 200:
+                print(f"Finnhub error ({category}) {res.status_code}: {res.text[:300]}")
+                return []
+            return res.json()
+        except Exception as e:
+            if attempt == 0:
+                continue
+            print(f"Finnhub fetch failed ({category}): {e}")
             return []
-        return res.json()
-    except Exception as e:
-        print(f"Finnhub fetch failed ({category}): {e}")
-        return []
+    return []
 
 
 def fetch_rss_articles(feed_url, source_name):
@@ -285,8 +321,17 @@ def fetch_rss_articles(feed_url, source_name):
     through the exact same scrape/classify/send pipeline with no special-casing."""
     import xml.etree.ElementTree as ET
 
+    for attempt in range(2):  # one retry - a single timeout shouldn't cost us the whole poll
+        try:
+            res = requests.get(feed_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            break
+        except Exception as e:
+            if attempt == 0:
+                continue
+            print(f"RSS fetch failed ({source_name}): {e}")
+            return []
+
     try:
-        res = requests.get(feed_url, headers=HEADERS, timeout=10)
         if res.status_code != 200:
             print(f"RSS error ({source_name}) {res.status_code}")
             return []
@@ -366,7 +411,8 @@ def process_live_news(state, now_ts, browser=None):
             publisher = item.get("source", "Reuters")
 
             scraped_img, body_text = scrape_article_details(article_url, browser)
-            final_image = scraped_img if scraped_img else item.get("image")
+            is_redirect_link = "news.google.com" in article_url
+            final_image = None if is_redirect_link else (scraped_img if scraped_img else item.get("image"))
 
             classification = classify_article(headline, summary, body_text)
 
@@ -464,6 +510,8 @@ def main():
             except Exception as e:
                 print(f"Loop iteration error: {e}")
             time.sleep(POLL_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        print("\nStopped by user (Ctrl+C).")
     finally:
         if browser:
             try:
@@ -476,10 +524,11 @@ def main():
             except Exception:
                 pass
 
-    print("4h 55m daemon cycle finished cleanly.")
+    if RUNNING_IN_CI:
+        print("4h 55m daemon cycle finished cleanly.")
+    else:
+        print("Engine stopped.")
 
 
 if __name__ == "__main__":
     main()
-
-    
