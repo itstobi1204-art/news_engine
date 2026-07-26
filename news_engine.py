@@ -124,7 +124,13 @@ def _extract_bullets(headline, summary, body_text):
 
 
 def classify_article(headline, summary, body_text):
-    haystack = f" {headline} {summary} {body_text[:1500]} ".lower()
+    # Deliberately headline+summary ONLY, not body_text - a soft feature story
+    # can easily mention "recession" or "Wall Street" once in passing while
+    # discussing something unrelated, and that was getting misread as the
+    # story itself being high-impact market news. Headlines/summaries are
+    # curated by the publisher to reflect what the story is actually about;
+    # body text is not a reliable relevance signal here.
+    haystack = f" {headline} {summary} ".lower()
 
     matched_symbol = None
     for group in _ALL_CATEGORY_GROUPS:
@@ -189,99 +195,11 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 
-def _resolve_google_news_redirect(article_url, browser=None):
-    """Google News article links are redirect stubs, not real article pages.
-    Try, in order of reliability:
-    1. googlenewsdecoder - calls Google's own internal decode endpoint directly
-       (the same mechanism their JS uses), so it isn't a "browser" Google can bot-detect.
-    2. Plain HTTP follow - works for the subset that redirect via a normal 30x.
-    3. Headless browser - needs real JS execution, but Google actively fingerprints
-       and blocks automated browsers, so this is the least reliable of the three."""
-    try:
-        from googlenewsdecoder import new_decoderv1
-        result = new_decoderv1(article_url, interval=1)
-        if result.get("status") and result.get("decoded_url"):
-            real_url = result["decoded_url"]
-            print(f"Google redirect resolved (decoder): {real_url}")
-            res = requests.get(real_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            if res.status_code == 200:
-                return real_url, res.text
-        else:
-            print(f"Google redirect decoder returned no result: {result}")
-    except ImportError:
-        print("googlenewsdecoder not installed - falling back to HTTP/browser resolution.")
-    except Exception as e:
-        print(f"Google redirect decoder failed: {e}")
-
-    # Fast path: plain HTTP follow
-    try:
-        res = requests.get(article_url, headers=HEADERS, timeout=8, allow_redirects=True)
-        if res.status_code == 200 and "news.google.com" not in res.url:
-            print(f"Google redirect resolved (HTTP): {res.url}")
-            return res.url, res.text
-        print(f"Google redirect fast-path did not escape google.com (status {res.status_code}) - trying browser.")
-    except Exception as e:
-        print(f"Google redirect fast-path failed: {e}")
-
-    # Slow path: needs real JS execution to redirect
-    if browser is not None:
-        page = None
-        try:
-            page = browser.new_page(user_agent=HEADERS["User-Agent"])
-            page.set_default_timeout(10000)
-            page.goto(article_url, wait_until="networkidle", timeout=10000)
-            resolved_url = page.url
-            if "news.google.com" not in resolved_url:
-                print(f"Google redirect resolved (browser): {resolved_url}")
-                return resolved_url, page.content()
-            print(f"Google redirect browser attempt still on google.com ({resolved_url}) - likely bot-blocked, giving up.")
-        except Exception as e:
-            print(f"Google redirect browser attempt failed: {e}")
-        finally:
-            if page:
-                page.close()
-    else:
-        print("Google redirect: no browser available for JS-redirect attempt.")
-
-    return None, None
-
-
 def scrape_article_details(article_url, browser=None):
     cover_image = None
     body_text = ""
     if not article_url or article_url == "N/A":
         return cover_image, body_text
-
-    # Google News redirect links (used for licensed wire-service redistribution,
-    # e.g. Reuters via aggregator feeds) aren't real article pages. Try to resolve
-    # to the actual underlying article first - if that works, extract from it
-    # normally below. If it genuinely can't be resolved, there's nothing to scrape;
-    # the RSS summary is a better source of truth than a broken redirect stub.
-    if "news.google.com" in article_url:
-        resolved_url, resolved_html = _resolve_google_news_redirect(article_url, browser)
-        if not resolved_url:
-            return None, ""
-        article_url = resolved_url
-        # fall through to Tier 1 below, but reuse the HTML we already fetched
-        # instead of a third network round-trip
-        try:
-            soup = BeautifulSoup(resolved_html, "html.parser")
-            og_img = (
-                soup.find("meta", property="og:image")
-                or soup.find("meta", attrs={"name": "twitter:image"})
-                or soup.find("meta", property="twitter:image")
-            )
-            if og_img and og_img.get("content"):
-                cover_image = og_img["content"]
-            extracted = trafilatura.extract(resolved_html, include_comments=False, include_tables=False)
-            if extracted:
-                body_text = extracted.strip()
-        except Exception as e:
-            print(f"Resolved-redirect extraction failed for {article_url}: {e}")
-        if body_text:
-            return cover_image, body_text
-        # thin result even after resolving - still worth trying tier 2 below with
-        # the resolved URL rather than the dead-end google.com stub
 
     # Tier 1: fast static fetch + trafilatura (proper main-content extraction,
     # strips ads/nav/related-articles junk far better than raw <p> joining)
@@ -496,9 +414,17 @@ def process_live_news(state, now_ts, browser=None):
             article_url = item.get("url", "N/A")
             publisher = item.get("source", "Reuters")
 
+            # Google News redirect links (licensed wire-content redistribution) never
+            # give a real image or real extractable text, and every attempt to work
+            # around that has proven unreliable. Drop these entirely - mark seen,
+            # never send - rather than keep sending thin/imageless alerts.
+            if "news.google.com" in article_url:
+                state["sent_ids"].append(article_id)
+                save_state(state)
+                continue
+
             scraped_img, body_text = scrape_article_details(article_url, browser)
-            unresolved_redirect = "news.google.com" in article_url and not scraped_img
-            final_image = None if unresolved_redirect else (scraped_img if scraped_img else item.get("image"))
+            final_image = scraped_img if scraped_img else item.get("image")
 
             classification = classify_article(headline, summary, body_text)
 
