@@ -195,6 +195,24 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 
+_BLOCK_PAGE_SIGNS = [
+    "access denied", "you don't have permission to access",
+    "reference #", "request blocked", "403 forbidden",
+    "attention required", "checking your browser",
+]
+
+
+def _looks_like_block_page(text):
+    """Some WAFs (Akamai etc.) serve their block/challenge page with a normal
+    200 status, so a status-code check alone doesn't catch it - trafilatura
+    happily 'extracts' the block page's own text as if it were the article.
+    Catch it by content instead."""
+    if not text or len(text) > 600:
+        return False  # a real article this short is rare, but block pages are always short
+    lowered = text.lower()
+    return any(sign in lowered for sign in _BLOCK_PAGE_SIGNS)
+
+
 def scrape_article_details(article_url, browser=None):
     cover_image = None
     body_text = ""
@@ -217,8 +235,11 @@ def scrape_article_details(article_url, browser=None):
                 cover_image = og_img["content"]
 
             extracted = trafilatura.extract(raw_html, include_comments=False, include_tables=False)
-            if extracted:
+            if extracted and not _looks_like_block_page(extracted):
                 body_text = extracted.strip()
+            elif extracted:
+                print(f"Scrape notice: {article_url} returned a block/access-denied page, discarding as content.")
+                cover_image = None  # the "image" on a block page is the WAF's own logo, not a real photo
         else:
             print(f"Scrape notice: {article_url} returned status {res.status_code}")
     except Exception as e:
@@ -236,7 +257,7 @@ def scrape_article_details(article_url, browser=None):
             rendered_html = page.content()
 
             extracted = trafilatura.extract(rendered_html, include_comments=False, include_tables=False)
-            if extracted and len(extracted) > len(body_text):
+            if extracted and not _looks_like_block_page(extracted) and len(extracted) > len(body_text):
                 body_text = extracted.strip()
 
             if not cover_image:
