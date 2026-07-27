@@ -96,6 +96,24 @@ MEDIUM_IMPACT_KEYWORDS = [
     "tariff", "crude oil", "gold price",
 ]
 
+# A "week ahead" / "3 things to watch" / calendar-preview piece mentioning the Fed
+# is a very different urgency than the Fed actually announcing something right now -
+# but keyword presence alone can't tell those apart. Roundup language caps severity
+# down a notch, since it's a preview/summary of things, not a single breaking event.
+PREVIEW_ROUNDUP_PHRASES = [
+    "week ahead", "things to watch", "things we're watching", "main events for",
+    "what to expect", "what to watch", "day ahead", "week in focus", "in focus this week",
+    "key events this week", "here are the",
+]
+
+# "War" or "central bank" appearing next to de-escalation language (a ceasefire,
+# a pause, talks resuming) is a calming development, not a shock - it shouldn't
+# read at the same alarm level as an escalation or a surprise policy move.
+DE_ESCALATION_PHRASES = [
+    "halt strikes", "halts strikes", "halt attacks", "ceasefire", "cease-fire",
+    "pause continues", "maintains pause", "de-escalat", "peace talks", "truce",
+]
+
 _ALL_CATEGORY_GROUPS = [FOREX_KEYWORDS, COMMODITY_KEYWORDS, INDEX_KEYWORDS, MACRO_KEYWORDS, MERGER_KEYWORDS]
 
 
@@ -153,11 +171,21 @@ def classify_article(headline, summary, body_text):
             "bullet_2": bullet_2,
         }
 
+    is_preview_roundup = any(phrase in haystack for phrase in PREVIEW_ROUNDUP_PHRASES)
+    is_deescalation = any(phrase in haystack for phrase in DE_ESCALATION_PHRASES)
+
     if any(kw in haystack for kw in HIGH_IMPACT_KEYWORDS):
-        impact_emoji = "🔴"
+        impact_emoji = "🟠" if is_deescalation else "🔴"
     elif any(kw in haystack for kw in MEDIUM_IMPACT_KEYWORDS):
-        impact_emoji = "🟠"
+        impact_emoji = "🟡" if is_deescalation else "🟠"
     else:
+        impact_emoji = "🟡"
+
+    # A calendar/roundup piece is a preview of several things, not one breaking
+    # event - cap it down a notch regardless of which topics it happens to cover.
+    if is_preview_roundup and impact_emoji == "🔴":
+        impact_emoji = "🟠"
+    elif is_preview_roundup and impact_emoji == "🟠":
         impact_emoji = "🟡"
 
     bullet_1, bullet_2 = _extract_bullets(headline, summary, body_text)
