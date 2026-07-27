@@ -44,11 +44,13 @@ NON_ENGLISH_PATH_MARKERS = ["/nl/", "/de/", "/fr/", "/es/", "/it/", "/pt/", "/zh
 # Tier-1 Day Trader Feed Sources
 FINNHUB_CATEGORIES = ["general", "forex"]
 
+# Updated Active RSS Feeds (Removed dead MarketWatch URL)
 RSS_FEEDS = {
     "https://investinglive.com/rss": "ForexLive",
     "https://www.fxstreet.com/rss/news": "FXStreet",
     "https://www.dailyfx.com/feeds/market-news": "DailyFX",
-    "https://feeds.content.dowjones.com/public/rss/mw_topstories": "MarketWatch",
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml": "WSJ Markets",
+    "https://finance.yahoo.com/news/rssindex": "Yahoo Finance",
     "https://www.cnbc.com/id/10000664/device/rss/rss.html": "CNBC Markets",
     "https://www.investing.com/rss/news_1.rss": "Investing.com (Forex)",
     "https://www.investing.com/rss/news_11.rss": "Investing.com (Commodities)",
@@ -263,7 +265,7 @@ def scrape_article_details(article_url, browser=None):
 
 def send_telegram_msg(formatted_text, image_url=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram configuration missing. Check your .env file.")
+        print("Telegram configuration missing. Check your environment setup.")
         return False
 
     for attempt in range(3):
@@ -321,7 +323,7 @@ def fetch_rss_articles(feed_url, source_name):
 
             pub_ts = 0
             if pub_date_str:
-                for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
+                for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S GMT"):
                     try:
                         pub_ts = datetime.strptime(pub_date_str, fmt).timestamp()
                         break
@@ -446,9 +448,9 @@ def main():
     print("==================================================")
 
     if not FINNHUB_KEY:
-        print("WARNING: FINNHUB_API_KEY is not set in your .env file!")
+        print("WARNING: FINNHUB_API_KEY is not set!")
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from .env!")
+        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing!")
 
     state = load_state()
 
