@@ -236,7 +236,7 @@ def scrape_article_details(article_url, browser=None):
 
             extracted = trafilatura.extract(raw_html, include_comments=False, include_tables=False)
             if extracted and not _looks_like_block_page(extracted):
-                body_text = extracted.strip()
+                body_text = html.unescape(extracted.strip())
             elif extracted:
                 print(f"Scrape notice: {article_url} returned a block/access-denied page, discarding as content.")
                 cover_image = None  # the "image" on a block page is the WAF's own logo, not a real photo
@@ -258,7 +258,7 @@ def scrape_article_details(article_url, browser=None):
 
             extracted = trafilatura.extract(rendered_html, include_comments=False, include_tables=False)
             if extracted and not _looks_like_block_page(extracted) and len(extracted) > len(body_text):
-                body_text = extracted.strip()
+                body_text = html.unescape(extracted.strip())
 
             if not cover_image:
                 soup2 = BeautifulSoup(rendered_html, "html.parser")
