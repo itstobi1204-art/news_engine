@@ -9,13 +9,13 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
-# Running on GitHub Actions?
+# Detect if running in GitHub Actions CI vs Local PC
 RUNNING_IN_CI = os.getenv("GITHUB_ACTIONS") == "true"
 
 if not RUNNING_IN_CI:
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        load_dotenv()  # Reads .env file sitting in the same directory locally
     except ImportError:
         pass
 
@@ -27,7 +27,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 STATE_FILE = "state.json"
 
 # Timing constants
-MAX_AGE_SECONDS = 2 * 3600  # 2 hours buffer
+MAX_AGE_SECONDS = 2 * 3600  # 2 hours lookback limit
+# Local PC runs infinitely until you stop it (Ctrl+C); CI runs for ~5h cycles
 LOOP_DURATION_SECONDS = (4 * 3600 + 55 * 60) if RUNNING_IN_CI else float("inf")
 POLL_INTERVAL_SECONDS = 15
 REQUEST_TIMEOUT = 15
@@ -37,7 +38,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Non-English URL paths to drop immediately (e.g., BusinessWire localized feeds)
+# Non-English URL paths to drop immediately
 NON_ENGLISH_PATH_MARKERS = ["/nl/", "/de/", "/fr/", "/es/", "/it/", "/pt/", "/zh/", "/ja/", "/ru/", "/kr/"]
 
 # Tier-1 Day Trader Feed Sources
@@ -146,7 +147,7 @@ def _extract_bullets(headline, summary, body_text):
 
 
 def classify_article(headline, summary, body_text, article_url):
-    """Filters out noise, demotes commentary notes, and classifies impact."""
+    """Filters noise, demotes commentary notes, and classifies impact."""
     if not is_english_content(f"{headline} {summary}", article_url):
         return {"is_relevant": False}
 
@@ -161,16 +162,16 @@ def classify_article(headline, summary, body_text, article_url):
         if matched_symbol:
             break
 
-    # STRICT RELEVANCE: Reject non-matching corporate news/noise
+    # STRICT RELEVANCE: Reject corporate noise or unmatched articles
     if not matched_symbol:
         return {"is_relevant": False}
 
-    # Commentary demotion check
+    # Demote analyst opinion/previews to Yellow
     is_commentary = any(cw in haystack for cw in COMMENTARY_KEYWORDS)
 
     # Forex Factory Impact Classification
     if any(kw in haystack for kw in HIGH_IMPACT_KEYWORDS):
-        impact_emoji = "🟡" if is_commentary else "🔴"  # Demote bank preview/opinion to Yellow
+        impact_emoji = "🟡" if is_commentary else "🔴"
     elif any(kw in haystack for kw in MEDIUM_IMPACT_KEYWORDS):
         impact_emoji = "🟡" if is_commentary else "🟠"
     else:
@@ -232,7 +233,7 @@ def scrape_article_details(article_url, browser=None):
     except Exception as e:
         print(f"Scraper notice for {article_url}: {e}")
 
-    # Fallback to Headless Browser if content is sparse
+    # Fallback to Playwright Headless Browser for JS rendering
     if len(body_text) < 200 and browser is not None:
         page = None
         try:
@@ -262,7 +263,7 @@ def scrape_article_details(article_url, browser=None):
 
 def send_telegram_msg(formatted_text, image_url=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram configuration missing.")
+        print("Telegram configuration missing. Check your .env file.")
         return False
 
     for attempt in range(3):
@@ -292,6 +293,8 @@ def send_telegram_msg(formatted_text, image_url=None):
 
 
 def fetch_finnhub_articles(category):
+    if not FINNHUB_KEY:
+        return []
     url = f"https://finnhub.io/api/v1/news?category={category}&token={FINNHUB_KEY}"
     try:
         res = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -344,10 +347,6 @@ def fetch_rss_articles(feed_url, source_name):
 
 
 def process_live_news(state, now_ts, browser=None):
-    if not FINNHUB_KEY:
-        print("Error: FINNHUB_API_KEY environment variable missing.")
-        return
-
     try:
         articles = []
         seen_in_batch = set()
@@ -366,7 +365,7 @@ def process_live_news(state, now_ts, browser=None):
                     seen_in_batch.add(art_id)
                     articles.append(item)
 
-        # Filter new candidates
+        # Filter candidates
         candidate_items = []
         for item in articles:
             article_id = str(item.get("id") or item.get("url"))
@@ -379,7 +378,7 @@ def process_live_news(state, now_ts, browser=None):
 
             candidate_items.append(item)
 
-        # SORT BURST NEWS CHRONOLOGICALLY (Oldest published first)
+        # Sort candidate items chronologically (oldest first)
         candidate_items.sort(key=lambda x: x.get("datetime", 0))
 
         new_count = 0
@@ -429,23 +428,31 @@ def process_live_news(state, now_ts, browser=None):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
-                time.sleep(1.8)  # Anti-burst throttle delay
+                time.sleep(1.8)  # Throttle Telegram messages
             else:
                 state["sent_ids"].append(article_id)
                 save_state(state)
 
         if new_count == 0:
-            print(f"No new qualifying day-trading articles this poll.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Polled feeds — no new qualifying day-trading news.")
 
     except Exception as e:
         print(f"Error during news processing: {e}")
 
 
 def main():
-    print("Starting Day-Trader AI News Engine...")
+    print("==================================================")
+    print("      Starting Day-Trader Local Engine...        ")
+    print("==================================================")
+
+    if not FINNHUB_KEY:
+        print("WARNING: FINNHUB_API_KEY is not set in your .env file!")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from .env!")
+
     state = load_state()
 
-    # CRITICAL DUP-PREVENTION: Seed snapshot of all current feeds on boot
+    # Seed all active news on startup so old news isn't re-sent on local boot
     try:
         seeded = 0
         for category in FINNHUB_CATEGORIES:
@@ -463,11 +470,11 @@ def main():
                     seeded += 1
 
         save_state(state)
-        print(f"Boot seeding complete: Marked {seeded} existing feed items as seen.")
+        print(f"Boot seeding complete: Marked {seeded} current articles as seen.")
     except Exception as e:
         print(f"Boot seeding warning: {e}")
 
-    # Launch Headless Browser for JS scraping fallback
+    # Launch Headless Chromium Browser locally via Playwright
     playwright_ctx = None
     browser = None
     try:
@@ -476,9 +483,11 @@ def main():
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        print("Headless browser ready.")
+        print("Local Headless Browser started successfully.")
     except Exception as e:
-        print(f"Headless browser start failed: {e}")
+        print(f"Headless browser launch failed ({e}) — proceeding with static HTTP fetching.")
+
+    print("\n[ACTIVE] Engine is listening for live market news. Press Ctrl + C to exit.\n")
 
     try:
         start_time = time.time()
@@ -486,7 +495,7 @@ def main():
             process_live_news(state, time.time(), browser)
             time.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
-        print("\nStopped by user.")
+        print("\n[STOPPED] Day-Trader Engine closed by user.")
     finally:
         if browser:
             try: browser.close()
@@ -494,9 +503,6 @@ def main():
         if playwright_ctx:
             try: playwright_ctx.stop()
             except Exception: pass
-
-    if RUNNING_IN_CI:
-        print("4h 55m daemon cycle finished cleanly.")
 
 
 if __name__ == "__main__":
