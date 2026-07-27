@@ -4,6 +4,7 @@ import json
 import html
 import requests
 import trafilatura
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
@@ -36,7 +37,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Non-English URL paths to drop immediately (e.g. BusinessWire localized feeds)
+# Non-English URL paths to drop immediately (e.g., BusinessWire localized feeds)
 NON_ENGLISH_PATH_MARKERS = ["/nl/", "/de/", "/fr/", "/es/", "/it/", "/pt/", "/zh/", "/ja/", "/ru/", "/kr/"]
 
 # Tier-1 Day Trader Feed Sources
@@ -96,6 +97,12 @@ MEDIUM_IMPACT_KEYWORDS = [
     "crude oil", "gold price", "german ifo", "ppi ", "durable goods", "eia"
 ]
 
+# Commentary / Preview markers (Demotes bank opinions from false RED alerts to YELLOW)
+COMMENTARY_KEYWORDS = [
+    "economists", "preview", "says", "predicts", "analysts", "view", "expects", 
+    "forecasts", "dbs", "ing", "citi", "socgen", "commerzbank", "research note"
+]
+
 _ALL_CATEGORY_GROUPS = [FOREX_KEYWORDS, COMMODITY_KEYWORDS, INDEX_KEYWORDS, MACRO_KEYWORDS]
 
 
@@ -107,7 +114,6 @@ def is_english_content(text, url):
     if not text:
         return True
 
-    # Common English stopwords validation
     words = set(text.lower().split())
     english_stopwords = {"the", "and", "is", "in", "to", "of", "for", "on", "with", "at", "by", "this", "from"}
     if len(words) > 8:
@@ -140,7 +146,7 @@ def _extract_bullets(headline, summary, body_text):
 
 
 def classify_article(headline, summary, body_text, article_url):
-    """Filters out noise and classifies Forex Factory style impact."""
+    """Filters out noise, demotes commentary notes, and classifies impact."""
     if not is_english_content(f"{headline} {summary}", article_url):
         return {"is_relevant": False}
 
@@ -159,13 +165,16 @@ def classify_article(headline, summary, body_text, article_url):
     if not matched_symbol:
         return {"is_relevant": False}
 
-    # Impact color classification (Forex Factory Style)
+    # Commentary demotion check
+    is_commentary = any(cw in haystack for cw in COMMENTARY_KEYWORDS)
+
+    # Forex Factory Impact Classification
     if any(kw in haystack for kw in HIGH_IMPACT_KEYWORDS):
-        impact_emoji = "🔴"  # High Impact
+        impact_emoji = "🟡" if is_commentary else "🔴"  # Demote bank preview/opinion to Yellow
     elif any(kw in haystack for kw in MEDIUM_IMPACT_KEYWORDS):
-        impact_emoji = "🟠"  # Medium Impact
+        impact_emoji = "🟡" if is_commentary else "🟠"
     else:
-        impact_emoji = "🟡"  # Low Impact
+        impact_emoji = "🟡"
 
     bullet_1, bullet_2 = _extract_bullets(headline, summary, body_text)
 
@@ -294,7 +303,6 @@ def fetch_finnhub_articles(category):
 
 
 def fetch_rss_articles(feed_url, source_name):
-    import xml.etree.ElementTree as ET
     try:
         res = requests.get(feed_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if res.status_code != 200:
@@ -371,7 +379,7 @@ def process_live_news(state, now_ts, browser=None):
 
             candidate_items.append(item)
 
-        # SORT BURST NEWS CHRONOLOGICALLY (Oldest first -> Newest last)
+        # SORT BURST NEWS CHRONOLOGICALLY (Oldest published first)
         candidate_items.sort(key=lambda x: x.get("datetime", 0))
 
         new_count = 0
@@ -421,7 +429,7 @@ def process_live_news(state, now_ts, browser=None):
                 state["sent_ids"].append(article_id)
                 save_state(state)
                 print(f"[{ist_time}] Alert Sent: {headline}")
-                time.sleep(1.8)  # Smooth delay to prevent burst congestion
+                time.sleep(1.8)  # Anti-burst throttle delay
             else:
                 state["sent_ids"].append(article_id)
                 save_state(state)
