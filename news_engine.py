@@ -50,7 +50,7 @@ FINNHUB_CATEGORIES = ["general", "forex"]
 # Verified Working RSS Endpoints
 RSS_FEEDS = {
     "https://www.fxstreet.com/rss/news": "FXStreet",
-    "https://www.cnbc.com/id/15837362/device/rss/rss.html",
+    "https://www.cnbc.com/id/15837362/device/rss/rss.html": "cnbc",
     "https://www.investing.com/rss/news.rss": "investing",
     "https://investinglive.com/feed": "investinglive", 
 }
