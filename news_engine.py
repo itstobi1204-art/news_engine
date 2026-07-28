@@ -54,8 +54,6 @@ RSS_FEEDS = {
     "https://www.cnbc.com/id/20910258/device/rss/rss.html": "CNBC (Markets)",   
     "https://www.investing.com/rss/news_1.rss": "Investing.com (Forex)",
     "https://www.investing.com/rss/news_11.rss": "Investing.com (Commodities)",
-    "https://feeds.marketwatch.com/marketwatch/topstories/": "MarketWatch (Top Stories)",
-    "https://feeds.marketwatch.com/marketwatch/realtimeheadlines/": "MarketWatch (Real-Time)",
 }
 
 # Asset & Keyword Mappings
