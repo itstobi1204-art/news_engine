@@ -52,7 +52,6 @@ RSS_FEEDS = {
     "https://www.fxstreet.com/rss/news": "FXStreet",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html": "CNBC (Top News)",
     "https://www.cnbc.com/id/20910258/device/rss/rss.html": "CNBC (Markets)",
-    "https://www.investing.com/rss/central_banks.rss",
     "https://www.investing.com/rss/commodities.rss",
     "https://www.investing.com/rss/news.rss",
 }
