@@ -51,12 +51,12 @@ FINNHUB_CATEGORIES = ["general", "forex"]
 RSS_FEEDS = {
     "https://www.forexlive.com/feed/news": "ForexLive",
     "https://www.fxstreet.com/rss/news": "FXStreet",
-    "https://www.dailyfx.com/feeds/market-news": "DailyFX",
-    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml": "WSJ Markets",
-    "https://finance.yahoo.com/news/rssindex": "Yahoo Finance",
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html": "CNBC Markets",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html": "CNBC (Top News)",
+    "https://www.cnbc.com/id/20910258/device/rss/rss.html": "CNBC (Markets)",   
     "https://www.investing.com/rss/news_1.rss": "Investing.com (Forex)",
     "https://www.investing.com/rss/news_11.rss": "Investing.com (Commodities)",
+    "https://feeds.marketwatch.com/marketwatch/topstories/": "MarketWatch (Top Stories)",
+    "https://feeds.marketwatch.com/marketwatch/realtimeheadlines/": "MarketWatch (Real-Time)",
 }
 
 # Asset & Keyword Mappings
