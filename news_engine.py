@@ -55,7 +55,6 @@ RSS_FEEDS = {
     "https://www.investing.com/rss/central_banks.rss",
     "https://www.investing.com/rss/commodities.rss",
     "https://www.investing.com/rss/news.rss",
-    "https://investinglive.com/live-feed",
 }
 
 # Asset & Keyword Mappings
